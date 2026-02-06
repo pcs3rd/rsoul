@@ -2,3 +2,5 @@ slskd-api==0.1.5
 mobi_header==0.0.4
 ebookmeta==1.2.11
 rich>=13.0.0
+beautifulsoup4>=4.12.0
+requests>=2.31.0
