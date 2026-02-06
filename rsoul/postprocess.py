@@ -9,7 +9,7 @@ from typing import Any
 
 from mobi_header import MobiHeader
 import ebookmeta
-from .utils import sanitize_folder_name
+from .utils import sanitize_folder_name, jaccard_similarity
 from .display import print_import_summary, print_section_header
 
 logger = logging.getLogger("readarr_soul")
@@ -41,11 +41,140 @@ def move_failed_import(src_path: str):
         logger.exception(f"Error moving failed import from {src_path}")
 
 
-def validate_metadata(file_path: str, book_title: str, book_id: int, ctx: Any) -> bool:
+def check_title_similarity(
+    metadata_title: str,
+    expected_title: str,
+    ratio_exact: float,
+    ratio_normalized: float,
+    ratio_word: float,
+    ratio_loose: float,
+    ratio_jaccard: float,
+    label: str = "title",
+) -> bool:
+    """Check if metadata title matches expected title using multiple methods.
+
+    Args:
+        metadata_title: Title extracted from file metadata
+        expected_title: Expected title from Readarr
+        ratio_exact: Threshold for exact match
+        ratio_normalized: Threshold for normalized match
+        ratio_word: Threshold for word-based similarity
+        ratio_loose: Threshold for loose match (brackets removed)
+        ratio_jaccard: Threshold for Jaccard similarity
+        label: Label for logging (e.g., "title" or "seriesTitle")
+
+    Returns:
+        True if any method exceeds its threshold
+    """
+    # Exact match
+    diff = difflib.SequenceMatcher(None, metadata_title, expected_title).ratio()
+    logger.debug(f"[{label}] Exact match ratio: {diff:.3f}")
+
+    # Normalized match
+    normalized_meta = re.sub(r"[^\w\s]", "", metadata_title.lower())
+    normalized_expected = re.sub(r"[^\w\s]", "", expected_title.lower())
+    normalized_diff = difflib.SequenceMatcher(None, normalized_meta, normalized_expected).ratio()
+    logger.debug(f"[{label}] Normalized match ratio: {normalized_diff:.3f}")
+
+    # Word-based similarity
+    meta_words = set(metadata_title.lower().split())
+    expected_words = set(expected_title.lower().split())
+    word_intersection = len(meta_words.intersection(expected_words))
+    word_union = len(meta_words.union(expected_words))
+    word_similarity = word_intersection / word_union if word_union > 0 else 0
+    logger.debug(f"[{label}] Word-based similarity: {word_similarity:.3f}")
+
+    # Loose match (brackets/parentheses removed)
+    clean_meta = re.sub(r"\s*[\(\[].*?[\)\]]", "", metadata_title).strip()
+    clean_expected = re.sub(r"\s*[\(\[].*?[\)\]]", "", expected_title).strip()
+    clean_diff = 0.0
+    if clean_meta and clean_expected:
+        clean_diff = difflib.SequenceMatcher(None, clean_meta.lower(), clean_expected.lower()).ratio()
+        logger.debug(f"[{label}] Loose match ratio: {clean_diff:.3f}")
+
+    # Jaccard similarity
+    jaccard_score, overlap_count, _ = jaccard_similarity(metadata_title, expected_title)
+    logger.debug(f"[{label}] Jaccard similarity: {jaccard_score:.3f} ({overlap_count} words)")
+
+    # Check if any threshold is met
+    if diff > ratio_exact:
+        logger.info(f"[{label}] Passed on exact match: {diff:.3f} > {ratio_exact}")
+        return True
+    if normalized_diff > ratio_normalized:
+        logger.info(f"[{label}] Passed on normalized match: {normalized_diff:.3f} > {ratio_normalized}")
+        return True
+    if word_similarity > ratio_word:
+        logger.info(f"[{label}] Passed on word similarity: {word_similarity:.3f} > {ratio_word}")
+        return True
+    if clean_diff > ratio_loose:
+        logger.info(f"[{label}] Passed on loose match: {clean_diff:.3f} > {ratio_loose}")
+        return True
+    if jaccard_score > ratio_jaccard:
+        logger.info(f"[{label}] Passed on Jaccard: {jaccard_score:.3f} > {ratio_jaccard}")
+        return True
+
+    return False
+
+
+def check_swapped_author_title(metadata_title: str, expected_author: str, expected_title: str) -> bool:
+    """Check if author and title appear to be swapped in metadata.
+
+    Detects cases where the metadata title field contains the author name
+    (suggesting the fields are reversed in the ebook).
+
+    Args:
+        metadata_title: Title extracted from file metadata
+        expected_author: Expected author name from Readarr
+        expected_title: Expected book title from Readarr
+
+    Returns:
+        True if fields appear swapped (author in title field), False otherwise
+    """
+    # Normalize for comparison
+    meta_title_norm = metadata_title.lower().strip()
+    author_norm = expected_author.lower().strip()
+    title_norm = expected_title.lower().strip()
+
+    # Check if metadata title matches author better than it matches title
+    author_similarity = difflib.SequenceMatcher(None, meta_title_norm, author_norm).ratio()
+    title_similarity = difflib.SequenceMatcher(None, meta_title_norm, title_norm).ratio()
+
+    # If metadata title is very similar to author (>0.7) and not similar to title (<0.4)
+    # then fields are likely swapped
+    if author_similarity > 0.7 and title_similarity < 0.4:
+        logger.warning(f"Detected swapped metadata: title field contains author name")
+        logger.warning(f"  Metadata title: '{metadata_title}'")
+        logger.warning(f"  Expected author: '{expected_author}' (similarity: {author_similarity:.2f})")
+        logger.warning(f"  Expected title: '{expected_title}' (similarity: {title_similarity:.2f})")
+        return True
+
+    # Also check if author name is contained within the title field
+    if author_norm in meta_title_norm and title_norm not in meta_title_norm:
+        # Author name found in title, but actual title not found
+        if len(author_norm) > 5:  # Only flag if author name is substantial
+            logger.warning(f"Detected author name in title field: '{metadata_title}' contains '{expected_author}'")
+            return True
+
+    return False
+
+
+def validate_metadata(file_path: str, book_title: str, book_id: int, ctx: Any, series_title: str = "", author_name: str = "") -> bool:
     """
     Validate file metadata against Readarr book info.
     Returns True if validation passes or is skipped for the file type, False otherwise.
+
+    For EPUB/MOBI/AZW3 files, checks metadata title against both book_title and series_title.
+    Also detects swapped author/title fields.
+    If either matches (exceeds threshold), validation passes.
+
+    Can be globally disabled via config: [Postprocessing] skip_validation = True
     """
+    # Check for global skip flag
+    skip_validation = ctx.config.getboolean("Postprocessing", "skip_validation", fallback=False)
+    if skip_validation:
+        logger.info(f"Metadata validation disabled via config - skipping for: {file_path}")
+        return True
+
     extension = file_path.split(".")[-1].lower()
     match = False
     readarr_client = ctx.readarr
@@ -55,34 +184,58 @@ def validate_metadata(file_path: str, book_title: str, book_id: int, ctx: Any) -
     ratio_normalized = ctx.config.getfloat("Postprocessing", "match_ratio_normalized", fallback=0.85)
     ratio_word = ctx.config.getfloat("Postprocessing", "match_ratio_word", fallback=0.7)
     ratio_loose = ctx.config.getfloat("Postprocessing", "match_ratio_loose", fallback=0.85)
+    ratio_jaccard = ctx.config.getfloat("Postprocessing", "match_ratio_jaccard", fallback=0.5)
 
     # Enhanced metadata validation with better error handling
     if extension in ["azw3", "mobi"]:
         try:
             logger.info(f"Reading MOBI/AZW3 metadata from: {file_path}")
             metadata = MobiHeader(file_path)
-            isbn = metadata.get_exth_value_by_id(104)
 
-            if isbn is not None:
-                logger.info(f"Found ISBN in metadata: {isbn}")
-                try:
-                    book_lookup = readarr_client.lookup(term=f"isbn:{str(isbn).strip()}")
-                    if book_lookup and len(book_lookup) > 0:
-                        book_to_test = book_lookup[0]["id"]
-                        if book_to_test == book_id:
-                            logger.info("ISBN matches book ID - validation passed")
-                            match = True
-                        else:
-                            logger.warning(f"ISBN mismatch: expected {book_id}, got {book_to_test}")
-                            match = True
-                    else:
-                        logger.warning(f"No book found for ISBN {isbn} - cannot verify")
-                        match = False
-                except Exception as e:
-                    logger.error(f"Error looking up ISBN {isbn}: {e}")
+            # 1. Try Title Validation (Same as EPUB)
+            title = None
+            # Try getting full name from metadata dict
+            if hasattr(metadata, "metadata") and "full_name" in metadata.metadata:
+                title = metadata.metadata["full_name"].get("value")
+
+            # Fallback to EXTH 503 (Updated Title)
+            if not title:
+                title = metadata.get_exth_value_by_id(503)
+
+            if title:
+                # Decode bytes if necessary (MobiHeader might return bytes)
+                if isinstance(title, bytes):
+                    try:
+                        title = title.decode("utf-8")
+                    except Exception:
+                        title = str(title)
+
+                logger.info(f"Found title in metadata: '{title}'")
+                logger.info(f"Expected title: '{book_title}'")
+                if series_title:
+                    logger.info(f"Series title: '{series_title}'")
+
+                # Check for swapped author/title fields
+                if author_name and check_swapped_author_title(title, author_name, book_title):
+                    logger.warning("Metadata appears to have swapped author/title - rejecting")
                     match = False
+                else:
+                    # Check against book title
+                    title_match = check_title_similarity(title, book_title, ratio_exact, ratio_normalized, ratio_word, ratio_loose, ratio_jaccard, label="title")
+
+                    # Check against series title if provided and title didn't match
+                    series_match = False
+                    if not title_match and series_title:
+                        series_match = check_title_similarity(title, series_title, ratio_exact, ratio_normalized, ratio_word, ratio_loose, ratio_jaccard, label="seriesTitle")
+
+                    if title_match or series_match:
+                        logger.info("Title validation passed")
+                        match = True
+                    else:
+                        logger.warning("Title validation failed - insufficient similarity to both title and seriesTitle")
+                        match = False
             else:
-                logger.warning("No ISBN found in metadata - cannot verify")
+                logger.warning("No title found in MOBI/AZW3 metadata - cannot verify")
                 match = False
 
         except Exception as e:
@@ -98,38 +251,28 @@ def validate_metadata(file_path: str, book_title: str, book_id: int, ctx: Any) -
             if title:
                 logger.info(f"Found title in metadata: '{title}'")
                 logger.info(f"Expected title: '{book_title}'")
+                if series_title:
+                    logger.info(f"Series title: '{series_title}'")
 
-                # Enhanced title matching
-                diff = difflib.SequenceMatcher(None, title, book_title).ratio()
-                logger.info(f"Exact title match ratio: {diff:.3f}")
-
-                normalized_title = re.sub(r"[^\w\s]", "", title.lower())
-                normalized_book_title = re.sub(r"[^\w\s]", "", book_title.lower())
-                normalized_diff = difflib.SequenceMatcher(None, normalized_title, normalized_book_title).ratio()
-                logger.info(f"Normalized title match ratio: {normalized_diff:.3f}")
-
-                title_words = set(title.lower().split())
-                book_title_words = set(book_title.lower().split())
-                word_intersection = len(title_words.intersection(book_title_words))
-                word_union = len(title_words.union(book_title_words))
-                word_similarity = word_intersection / word_union if word_union > 0 else 0
-                logger.info(f"Word-based similarity: {word_similarity:.3f}")
-
-                # Loose match: Remove content in brackets/parentheses and compare
-                clean_title = re.sub(r"\s*[\(\[].*?[\)\]]", "", title).strip()
-                clean_book_title = re.sub(r"\s*[\(\[].*?[\)\]]", "", book_title).strip()
-
-                clean_diff = 0.0
-                if clean_title and clean_book_title:
-                    clean_diff = difflib.SequenceMatcher(None, clean_title.lower(), clean_book_title.lower()).ratio()
-                    logger.info(f"Loose match (brackets removed) ratio: {clean_diff:.3f} ('{clean_title}' vs '{clean_book_title}')")
-
-                if diff > ratio_exact or normalized_diff > ratio_normalized or word_similarity > ratio_word or clean_diff > ratio_loose:
-                    logger.info("Title validation passed")
-                    match = True
-                else:
-                    logger.warning(f"Title validation failed - insufficient similarity")
+                # Check for swapped author/title fields
+                if author_name and check_swapped_author_title(title, author_name, book_title):
+                    logger.warning("Metadata appears to have swapped author/title - rejecting")
                     match = False
+                else:
+                    # Check against book title
+                    title_match = check_title_similarity(title, book_title, ratio_exact, ratio_normalized, ratio_word, ratio_loose, ratio_jaccard, label="title")
+
+                    # Check against series title if provided and title didn't match
+                    series_match = False
+                    if not title_match and series_title:
+                        series_match = check_title_similarity(title, series_title, ratio_exact, ratio_normalized, ratio_word, ratio_loose, ratio_jaccard, label="seriesTitle")
+
+                    if title_match or series_match:
+                        logger.info("Title validation passed")
+                        match = True
+                    else:
+                        logger.warning("Title validation failed - insufficient similarity to both title and seriesTitle")
+                        match = False
             else:
                 logger.warning("No title found in EPUB metadata - cannot verify")
                 match = False
@@ -163,9 +306,9 @@ def organize_file(source_path: str, target_folder: str, filename: str, original_
             shutil.move(source_path, target_file_path)
             logger.info("File moved successfully")
 
-            # Clean up source directory if empty
+            # Clean up source directory if empty (but don't delete base download dirs)
             try:
-                if os.path.exists(original_folder) and not os.listdir(original_folder):
+                if original_folder and original_folder not in [".", os.getcwd()] and os.path.exists(original_folder) and not os.listdir(original_folder):
                     logger.info(f"Removing empty source directory: {original_folder}")
                     shutil.rmtree(original_folder)
             except OSError as e:
@@ -276,99 +419,175 @@ def monitor_imports(readarr_client: Any, commands: list) -> None:
 
 
 def process_imports(ctx: Any, grab_list: list):
-    """Process downloaded files, validate metadata, and trigger Readarr import"""
+    """Process downloaded files, validate metadata, and trigger Readarr import.
+
+    Handles items from multiple backends by grouping them and using backend-specific paths.
+    """
     print_section_header("METADATA VALIDATION & IMPORT PHASE")
 
     readarr_disable_sync = ctx.config.getboolean("Readarr", "disable_sync", fallback=False)
-    slskd_download_dir = ctx.config["Slskd"]["download_dir"]
-    readarr_download_dir = ctx.config["Readarr"]["download_dir"]
+
+    # Legacy fallback
+    default_slskd_dir = ctx.config.get("Slskd", "download_dir", fallback="")
+    default_readarr_dir = ctx.config.get("Slskd", "readarr_download_dir", fallback=default_slskd_dir)
+
     readarr = ctx.readarr
 
     # Check if sync is disabled first
     if readarr_disable_sync:
         logger.warning("Readarr sync is disabled in config. Skipping import phase.")
-        logger.info(f"Files downloaded but not imported. Check download directory: {slskd_download_dir}")
+        logger.info(f"Files downloaded but not imported.")
         return
 
-    os.chdir(slskd_download_dir)
-    logger.info(f"Changed to download directory: {slskd_download_dir}")
+    # Group items by backend to handle directory switching
+    items_by_backend = {}
+    for item in grab_list:
+        backend_name = item.get("backend_name", "slskd")  # Default to slskd for legacy items
+        if backend_name not in items_by_backend:
+            items_by_backend[backend_name] = []
+        items_by_backend[backend_name].append(item)
 
-    grab_list.sort(key=operator.itemgetter("author_name"))
-    failed_imports = []
-    author_folders = set()
+    # Process each backend's items
+    for backend_name, items in items_by_backend.items():
+        logger.info(f"Processing {len(items)} items for backend: {backend_name}")
 
-    for book_download in grab_list:
-        try:
-            author_name = book_download["author_name"]
-            author_name_sanitized = sanitize_folder_name(author_name)
-            folder = book_download["dir"]
-            # Optimization: Split on backslash per Soulseek convention and user request
-            filename = book_download["filename"].split("\\")[-1]
-            book_title = book_download["title"]
-            book_id = book_download["bookId"]
+        # Determine directories
+        local_download_dir = ""
+        readarr_download_dir = ""
 
-            logger.info(f"Processing file: {filename} for book: {book_title}")
-            source_file_path = os.path.join(folder, filename)
-
-            if not os.path.exists(source_file_path):
-                logger.error(f"Source file not found: {source_file_path}")
-                failed_imports.append((folder, filename, author_name_sanitized, f"Source file not found: {source_file_path}"))
-                continue
-
-            # 1. Validate Metadata
-            if validate_metadata(source_file_path, book_title, book_id, ctx):
-                # 2. Organize File
-                if organize_file(source_file_path, author_name_sanitized, filename, folder):
-                    logger.info(f"Successfully processed {filename}")
-                    author_folders.add(author_name_sanitized)
-                else:
-                    failed_imports.append((folder, filename, author_name_sanitized, "Failed to organize file"))
+        if ctx.orchestrator:
+            backend = ctx.orchestrator.get_backend(backend_name)
+            if backend:
+                local_download_dir = backend.download_dir
+                readarr_download_dir = backend.readarr_download_dir
             else:
-                logger.warning(f"Metadata validation failed for {filename}")
-                failed_imports.append((folder, filename, author_name_sanitized, "Metadata validation failed"))
+                logger.warning(f"Backend {backend_name} not found in orchestrator - using defaults")
 
-        except Exception:
-            logger.exception(f"Unexpected error processing {book_download.get('filename', 'unknown')}")
-            failed_imports.append((book_download.get("dir", "unknown"), book_download.get("filename", "unknown"), book_download.get("author_name", "unknown"), "Unexpected error"))
+        # Fallbacks for legacy/missing backend
+        if not local_download_dir:
+            local_download_dir = default_slskd_dir
+        if not readarr_download_dir:
+            readarr_download_dir = default_readarr_dir
 
-    # Handle failed imports
-    if failed_imports:
-        logger.warning(f"{len(failed_imports)} files failed validation/processing")
+        if not local_download_dir or not os.path.exists(local_download_dir):
+            logger.error(f"Download directory not found for {backend_name}: {local_download_dir}")
+            continue
 
-        for folder, filename, author_name_sanitized, error_reason in failed_imports:
-            logger.warning(f"Failed: {filename} - Reason: {error_reason}")
+        # Change to backend's download directory so organize_file works with relative paths
+        try:
+            os.chdir(local_download_dir)
+            logger.info(f"Changed to download directory: {local_download_dir}")
+        except OSError as e:
+            logger.error(f"Failed to change to directory {local_download_dir}: {e}")
+            continue
 
-            failed_imports_dir = "failed_imports"
+        items.sort(key=operator.itemgetter("author_name"))
+        failed_imports = []
+        author_folders = set()
+
+        for book_download in items:
             try:
-                if not os.path.exists(failed_imports_dir):
-                    os.makedirs(failed_imports_dir)
-                    logger.info(f"Created failed imports directory: {failed_imports_dir}")
+                author_name = book_download["author_name"]
+                author_name_sanitized = sanitize_folder_name(author_name)
+                folder = book_download["dir"]
 
-                target_path = os.path.join(failed_imports_dir, author_name_sanitized)
-                counter = 1
-                while os.path.exists(target_path):
-                    target_path = os.path.join(failed_imports_dir, f"{author_name_sanitized}_{counter}")
-                    counter += 1
+                # Backend-specific filename extraction
+                if backend_name == "slskd":
+                    # Slskd returns Windows-style paths even on Linux (e.g. C:\Books\Author - Title.epub)
+                    # Use legacy splitting on backslash to preserve compatibility
+                    filename = book_download["filename"].split("\\")[-1]
+                else:
+                    # Stacks/Other: Standard extraction (handle both separators safely)
+                    filename = re.split(r"[\\/]", book_download["filename"])[-1]
 
-                os.makedirs(target_path, exist_ok=True)
+                book_title = book_download["title"]
+                series_title = book_download.get("seriesTitle", "")
+                book_id = book_download["bookId"]
+                username = book_download.get("username", "")
 
+                logger.info(f"Processing file: {filename} for book: {book_title}")
                 source_file_path = os.path.join(folder, filename)
-                if os.path.exists(source_file_path):
-                    shutil.move(source_file_path, target_path)
-                    logger.info(f"Moved failed file to: {target_path}")
 
-                    if os.path.exists(folder) and not os.listdir(folder):
-                        shutil.rmtree(folder)
+                if not os.path.exists(source_file_path):
+                    logger.error(f"Source file not found: {source_file_path}")
+                    failed_imports.append((folder, filename, author_name_sanitized, f"Source file not found: {source_file_path}"))
+                    if ctx.history:
+                        ctx.history.add_failure(username, book_title, "Source file not found")
+                    continue
 
-            except Exception as e:
-                logger.error(f"Error handling failed import for {filename}: {e}")
+                # 1. Validate Metadata (skip for stacks backend - trust AA matching)
+                skip_validation = backend_name == "stacks"
+                if skip_validation:
+                    logger.info(f"Skipping metadata validation for stacks backend: {filename}")
+                    validation_passed = True
+                else:
+                    validation_passed = validate_metadata(source_file_path, book_title, book_id, ctx, series_title, author_name)
 
-    # 3. Trigger & 4. Monitor Imports
-    if author_folders:
-        commands = trigger_imports(readarr, readarr_download_dir, list(author_folders))
-        if commands:
-            monitor_imports(readarr, commands)
+                if validation_passed:
+                    # 2. Organize File
+                    if organize_file(source_file_path, author_name_sanitized, filename, folder):
+                        logger.info(f"Successfully processed {filename}")
+                        author_folders.add(author_name_sanitized)
+                    else:
+                        failed_imports.append((folder, filename, author_name_sanitized, "Failed to organize file"))
+                        if ctx.history:
+                            ctx.history.add_failure(username, book_title, "Failed to organize file")
+                else:
+                    logger.warning(f"Metadata validation failed for {filename}")
+                    failed_imports.append((folder, filename, author_name_sanitized, "Metadata validation failed"))
+                    if ctx.history:
+                        ctx.history.add_failure(username, book_title, "Metadata validation failed")
+
+            except Exception:
+                logger.exception(f"Unexpected error processing {book_download.get('filename', 'unknown')}")
+                failed_imports.append((book_download.get("dir", "unknown"), book_download.get("filename", "unknown"), book_download.get("author_name", "unknown"), "Unexpected error"))
+                if ctx.history:
+                    u = book_download.get("username", "")
+                    t = book_download.get("title", "")
+                    if u and t:
+                        ctx.history.add_failure(u, t, "Unexpected processing error")
+
+        # Handle failed imports
+        if failed_imports:
+            logger.warning(f"{len(failed_imports)} files failed validation/processing")
+
+            for folder, filename, author_name_sanitized, error_reason in failed_imports:
+                logger.warning(f"Failed: {filename} - Reason: {error_reason}")
+
+                failed_imports_dir = "failed_imports"
+                try:
+                    if not os.path.exists(failed_imports_dir):
+                        os.makedirs(failed_imports_dir)
+                        logger.info(f"Created failed imports directory: {failed_imports_dir}")
+
+                    target_path = os.path.join(failed_imports_dir, author_name_sanitized)
+                    counter = 1
+                    while os.path.exists(target_path):
+                        target_path = os.path.join(failed_imports_dir, f"{author_name_sanitized}_{counter}")
+                        counter += 1
+
+                    os.makedirs(target_path, exist_ok=True)
+
+                    source_file_path = os.path.join(folder, filename)
+                    if os.path.exists(source_file_path):
+                        shutil.move(source_file_path, target_path)
+                        logger.info(f"Moved failed file to: {target_path}")
+
+                        if os.path.exists(folder) and not os.listdir(folder):
+                            shutil.rmtree(folder)
+
+                except Exception as e:
+                    logger.error(f"Failed to move failed import: {e}")
+
+        # Trigger imports for this backend's successful folders using the mapped path
+        if author_folders:
+            logger.info(f"Triggering imports for backend {backend_name} using path: {readarr_download_dir}")
+            commands = trigger_imports(readarr, readarr_download_dir, list(author_folders))
+            if commands:
+                monitor_imports(readarr, commands)
+
         else:
-            logger.warning("No import commands were created successfully")
-    else:
+            logger.warning(f"No successful imports for backend {backend_name}")
+
+    if not items_by_backend:
         logger.warning("No author folders found to import")

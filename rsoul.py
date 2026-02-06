@@ -16,6 +16,10 @@ from rsoul.display import print_startup_banner, console
 from rsoul.utils import is_docker
 from rsoul.workflow import run_workflow
 from rsoul.search import get_books
+from rsoul.history import HistoryManager
+from rsoul.state import StateManager
+from rsoul.backends import create_backends_from_config
+from rsoul.orchestrator import DownloadOrchestrator
 
 logger = logging.getLogger("readarr_soul")
 
@@ -101,8 +105,28 @@ def main():
         slskd = slskd_api.SlskdClient(host=slskd_host_url, api_key=slskd_api_key, url_base=slskd_url_base)
         readarr = ReadarrAPI(readarr_host_url, readarr_api_key)
 
+        # Initialize History Manager
+        history_manager = HistoryManager(config_dir)
+
+        # Initialize State Manager for resume functionality
+        state_manager = StateManager(config_dir)
+
         # Initialize Context
-        ctx = Context(config=config, slskd=slskd, readarr=readarr, config_dir=config_dir)
+        ctx = Context(config=config, slskd=slskd, readarr=readarr, config_dir=config_dir, history=history_manager, state=state_manager)
+
+        # Initialize backends and orchestrator
+        backends = create_backends_from_config(ctx)
+        if backends:
+            orchestrator = DownloadOrchestrator(backends, ctx)
+            ctx.orchestrator = orchestrator
+            logger.info(f"Initialized {len(backends)} backend(s): {[b.name for b in backends]}")
+        else:
+            logger.warning("No backends available - downloads will fail")
+
+        # Check if we have saved state to resume
+        has_saved_state = state_manager.has_pending_state()
+        if has_saved_state:
+            console.print(f"\nFound saved state with {len(state_manager.get_items())} pending downloads", style="bold yellow")
 
         # Fetch Wanted Books
         wanted_books = []
@@ -124,14 +148,14 @@ def main():
                 try:
                     authorID = book["authorId"]
                     author = ctx.readarr.get_author(authorID)
-                    qprofile = ctx.readarr.get_quality_profile(author["qualityProfileId"])
-                    download_targets.append({"book": book, "author": author, "filetypes": qprofile})
+                    download_targets.append({"book": book, "author": author})
                 except Exception:
                     logger.exception(f"Error processing book {book.get('title', 'unknown')}")
                     continue
 
         # Run Workflow
-        if len(download_targets) > 0:
+        # Run if we have download targets OR if we have saved state to resume
+        if len(download_targets) > 0 or has_saved_state:
             try:
                 run_workflow(ctx, download_targets)
             except Exception:

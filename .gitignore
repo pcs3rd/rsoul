@@ -7,3 +7,8 @@ docs/
 pyproject.toml
 __pycache__/
 *.pyc
+
+# Temp files
+temp.html
+test.ini
+*.html

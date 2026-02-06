@@ -2,116 +2,64 @@ import time
 import logging
 import os
 import math
-from typing import Any, Optional, Dict, List, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .config import Context
 
 from .display import print_search_summary
-from .match import book_match, verify_filetype
-from .download import download_book
-from .utils import get_current_page, update_current_page, is_docker
-from .types import Book, Author, DownloadTarget, SlskdFile, SlskdDirectory, BookDownload, QualityProfile
+from .utils import get_current_page, update_current_page
+from .types import Book
 
 logger = logging.getLogger(__name__)
 
 
-def gen_allowed_filetypes(qprofile: QualityProfile) -> List[str]:
-    """Generate a list of allowed filetypes from a quality profile."""
-    allowed_filetypes: List[str] = []
-    for item in qprofile["items"]:
-        if item["allowed"]:
-            allowed_type = item["quality"]["name"].lower()
-            allowed_filetypes.append(allowed_type)
-    allowed_filetypes.reverse()
-    return allowed_filetypes
+def generate_fallback_queries(author_name: str, book_title: str, max_fallbacks: int) -> List[str]:
+    """Generate progressively degraded search queries for blocked word workaround.
 
+    Strategy:
+    1. First name + full title
+    2. First name + title with word 0 dropped
+    3. First name + title with word 1 dropped
+    ...continues left-to-right until max_fallbacks reached
 
-def is_blacklisted(ctx: "Context", title: str) -> bool:
-    """Check if a title contains any blacklisted words."""
-    blacklist = ctx.config.get("Search Settings", "title_blacklist", fallback="").lower().split(",")
-    for word in blacklist:
-        if word != "" and word in title.lower():
-            logger.info(f"Skipping {title} due to blacklisted word: {word}")
-            return True
-    return False
+    Args:
+        author_name: Full author name
+        book_title: Full book title
+        max_fallbacks: Maximum number of fallback queries to generate
 
-
-def check_for_match(
-    ctx: "Context",
-    file_cache: Dict[str, Dict[str, List[SlskdFile]]],
-    target: DownloadTarget,
-    allowed_filetype: str,
-) -> Tuple[bool, str, SlskdDirectory, str, Optional[SlskdFile]]:
+    Returns:
+        List of fallback query strings
     """
-    Check for matching files in the file cache.
+    queries = []
+    first_name = author_name.split()[0] if author_name else author_name
+    title_words = book_title.split()
+
+    # Step 1: First name + full title
+    queries.append(f"{first_name} - {book_title}")
+
+    # Steps 2+: Drop words left-to-right
+    for i in range(min(len(title_words), max_fallbacks - 1)):
+        remaining = " ".join(title_words[:i] + title_words[i + 1 :])
+        if remaining:
+            queries.append(f"{first_name} - {remaining}")
+
+    return queries[:max_fallbacks]
+
+
+def execute_search(ctx: "Context", query: str, search_type: str) -> Tuple[List[Dict[str, Any]], str]:
+    """Execute a single SLSKD search and return results.
 
     Args:
         ctx: Application context
-        file_cache: Dictionary containing cached file information
-        target: Target book/author information
-        allowed_filetype: File type to search for (e.g., 'epub', 'pdf')
+        query: Search query string
+        search_type: Label for display (e.g., "main", "fallback-1")
 
     Returns:
-        Tuple: (found, username, directory, file_dir, file) or (False, "", {}, "", None)
+        Tuple of (search results list, search ID for cleanup)
     """
-    for username in file_cache:
-        if not allowed_filetype in file_cache[username]:
-            continue
-        logger.info(f"Parsing result from user: {username}")
+    print_search_summary(query, 0, search_type, "searching")
 
-        # Construct a minimal directory object from the file list to pass to book_match
-        files = file_cache[username][allowed_filetype]
-
-        result = book_match(
-            target,
-            files,
-            username,
-            allowed_filetype,
-            ignored_users=ctx.config.get("Search Settings", "ignored_users", fallback="").split(","),
-            minimum_match_ratio=ctx.config.getfloat("Search Settings", "minimum_filename_match_ratio", fallback=0.5),
-        )
-
-        if result is not None:
-            # When a match is found, return the full file object.
-            # We also need file_dir and directory for the return tuple.
-            file_dir = result["filename"].rsplit("\\", 1)[0] if "\\" in result["filename"] else ""
-            directory = {"files": [result], "name": file_dir.split("\\")[-1] if "\\" in file_dir else file_dir}
-            return True, username, directory, file_dir, result
-
-    return False, "", {}, "", None
-
-
-def search_and_download(ctx: "Context", grab_list: List[BookDownload], target: DownloadTarget, retry_list: Dict[str, Any]) -> bool:
-    """
-    Search for a book and download it if a match is found.
-
-    Args:
-        ctx: Application context
-        grab_list: List of files to be grabbed
-        target: Target book/author information
-        retry_list: Dictionary of files to retry
-
-    Returns:
-        bool: True if a match was found and enqueued, False otherwise
-    """
-    book = target["book"]
-    author = target["author"]
-    qprofile = target["filetypes"]
-    author_name = author["authorName"]
-    book_title = book["title"]
-    allowed_filetypes = gen_allowed_filetypes(qprofile)
-
-    if is_blacklisted(ctx, book_title):
-        return False
-
-    delete_searches = ctx.config.getboolean("Slskd", "delete_searches", fallback=True)
-
-    # Construct query with proper " - " separator between author and title
-    query = f"{author_name} - {book_title}"
-    print_search_summary(query, 0, "main", "searching")  # Show searching status
-
-    # Perform initial search
     search = ctx.slskd.searches.search_text(
         searchText=query,
         searchTimeout=ctx.config.getint("Search Settings", "search_timeout", fallback=5000),
@@ -122,81 +70,13 @@ def search_and_download(ctx: "Context", grab_list: List[BookDownload], target: D
 
     time.sleep(10)
 
-    while True:
-        state = ctx.slskd.searches.state(search["id"], False)["state"]
-        if state != "InProgress":
-            break
+    while ctx.slskd.searches.state(search["id"], False)["state"] == "InProgress":
         time.sleep(1)
 
-    search_results = ctx.slskd.searches.search_responses(search["id"])
-    print_search_summary(query, len(search_results), "main", "completed")  # Show final results
+    results = ctx.slskd.searches.search_responses(search["id"])
+    print_search_summary(query, len(results), search_type, "completed")
 
-    # If no results and title contains ":", try searching with main title only
-    if len(search_results) == 0 and ":" in book_title:
-        # Extract main title (everything before ":")
-        main_title = book_title.split(":")[0].strip()
-        fallback_query = f"{author_name} - {main_title}"
-
-        logger.info(f"No results found for full title. Trying fallback search with main title: {fallback_query}")
-
-        # Delete the original search to clean up
-        if delete_searches:
-            ctx.slskd.searches.delete(search["id"])
-
-        print_search_summary(fallback_query, 0, "fallback", "searching")  # Show searching status
-
-        # Perform fallback search
-        search = ctx.slskd.searches.search_text(
-            searchText=fallback_query,
-            searchTimeout=ctx.config.getint("Search Settings", "search_timeout", fallback=5000),
-            filterResponses=True,
-            maximumPeerQueueLength=ctx.config.getint("Search Settings", "maximum_peer_queue", fallback=50),
-            minimumPeerUploadSpeed=ctx.config.getint("Search Settings", "minimum_peer_upload_speed", fallback=0),
-        )
-
-        time.sleep(10)
-
-        while True:
-            state = ctx.slskd.searches.state(search["id"], False)["state"]
-            if state != "InProgress":
-                break
-            time.sleep(1)
-
-        search_results = ctx.slskd.searches.search_responses(search["id"])
-        print_search_summary(fallback_query, len(search_results), "fallback", "completed")  # Show final results
-
-    # Continue with existing logic using search_results
-    file_cache = {}
-
-    for result in search_results:
-        username = result["username"]
-        if username not in file_cache:
-            file_cache[username] = {}
-
-        logger.info(f"Truncating directory count of user: {username}")
-        init_files = result["files"]
-
-        for file in init_files:
-            for allowed_filetype in allowed_filetypes:
-                if verify_filetype(file, allowed_filetype):
-                    if allowed_filetype not in file_cache[username]:
-                        file_cache[username][allowed_filetype] = []
-                    # Store the full file object
-                    file_cache[username][allowed_filetype].append(file)
-
-    for allowed_filetype in allowed_filetypes:
-        logger.info(f"Searching for matches with selected attributes: {allowed_filetype}")
-        found, username, directory, file_dir, file = check_for_match(ctx, file_cache, target, allowed_filetype)
-
-        if found:
-            if download_book(ctx.slskd, target, username, file_dir, directory, retry_list, grab_list, file):
-                if delete_searches:
-                    ctx.slskd.searches.delete(search["id"])
-                return True
-
-    if delete_searches:
-        ctx.slskd.searches.delete(search["id"])
-    return False
+    return results, search["id"]
 
 
 def get_books(ctx: "Context", search_source: str, search_type: str, page_size: int) -> List[Book]:

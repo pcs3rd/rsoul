@@ -46,6 +46,72 @@ def normalize_for_matching(text: str) -> str:
     return text.strip()
 
 
+def jaccard_similarity(str_a: str, str_b: str) -> tuple[float, int, int]:
+    """Calculate Jaccard similarity between two strings based on word tokens.
+
+    Args:
+        str_a: First string
+        str_b: Second string
+
+    Returns:
+        Tuple of (jaccard_score, overlap_count, union_count)
+    """
+    set_a = set(normalize_for_matching(str_a).split())
+    set_b = set(normalize_for_matching(str_b).split())
+
+    if not set_a or not set_b:
+        return 0.0, 0, 0
+
+    intersection = set_a & set_b
+    union = set_a | set_b
+
+    overlap_count = len(intersection)
+    union_count = len(union)
+
+    score = overlap_count / union_count if union_count > 0 else 0.0
+    return score, overlap_count, union_count
+
+
+def length_ratio(str_a: str, str_b: str) -> float:
+    """Calculate length ratio between two strings.
+
+    Returns:
+        Ratio of shorter/longer string (0.0-1.0)
+    """
+    len_a, len_b = len(str_a), len(str_b)
+    if len_a == 0 or len_b == 0:
+        return 0.0
+    return min(len_a, len_b) / max(len_a, len_b)
+
+
+def extract_author_title(filename: str) -> tuple[str, str]:
+    """Extract author and title components from a filename.
+
+    Tries common separators: " - ", " _ ", " by ".
+    Handles both "Author - Title" and "Title - Author" patterns.
+    Strips file extension before parsing.
+
+    Args:
+        filename: Filename to parse
+
+    Returns:
+        Tuple of (part1, part2) or (filename, "") if no separator found
+    """
+    # Remove extension
+    name = filename.rsplit(".", 1)[0] if "." in filename else filename
+
+    # Try common separators in order of preference
+    separators = [" - ", " _ ", " by "]
+
+    for sep in separators:
+        if sep in name:
+            parts = name.split(sep, 1)
+            if len(parts) == 2:
+                return parts[0].strip(), parts[1].strip()
+
+    return name.strip(), ""
+
+
 def title_contained_in_filename(target_title: str, filename: str) -> bool:
     """Check if the target title is contained in the filename with fuzzy matching"""
     normalized_target = normalize_for_matching(target_title)

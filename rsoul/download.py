@@ -3,7 +3,7 @@ import os
 import shutil
 import logging
 from typing import Any, Optional, Dict, List, Tuple
-from .types import Book, Author, DownloadTarget, SlskdFile, SlskdDirectory, BookDownload, QualityProfile
+from .types import SlskdFile, SlskdDirectory
 
 logger = logging.getLogger(__name__)
 
@@ -101,49 +101,6 @@ def downloads_all_done(downloads: List[SlskdFile]) -> Tuple[bool, Optional[List[
 
     result_error_list: Optional[List[SlskdFile]] = error_list if len(error_list) > 0 else None
     return all_done, result_error_list, remote_queue
-
-
-def download_book(
-    slskd_client: Any,
-    target: DownloadTarget,
-    username: str,
-    file_dir: str,
-    directory: SlskdDirectory,
-    retry_list: Dict[str, Any],
-    grab_list: List[BookDownload],
-    file: SlskdFile,
-) -> bool:
-    directory["files"] = [file]
-    filename = file["filename"]
-
-    for i in range(0, len(directory["files"])):
-        if "\\" not in directory["files"][i]["filename"]:
-            directory["files"][i]["filename"] = file_dir + "\\" + directory["files"][i]["filename"]
-
-    # Use the new enqueue function that returns tracked file objects with IDs
-    downloads = slskd_do_enqueue(slskd_client, username, directory["files"], file_dir)
-
-    if downloads:
-        folder_data = {
-            "author_name": target["author"]["authorName"],
-            "title": target["book"]["title"],
-            "bookId": target["book"]["id"],
-            "dir": file_dir.split("\\")[-1],
-            "full_dir": file_dir,
-            "username": username,
-            "directory": directory,
-            "filename": filename,
-            "files": downloads,  # Store the tracked files list
-            "count_start": time.time(),  # Initialize start time for timeouts
-            "rejected_retries": 0,
-            "error_count": 0,
-        }
-
-        grab_list.append(folder_data)
-        return True
-    else:
-        logger.warning(f"Failed to enqueue download for {target['book']['title']} from {username}")
-        return False
 
 
 def cancel_and_delete(slskd_client: Any, delete_dir: str, username: str, files: List[SlskdFile], download_base_dir: str) -> None:

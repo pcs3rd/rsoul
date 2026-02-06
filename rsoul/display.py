@@ -1,14 +1,6 @@
 import os
 import logging
 from rich.console import Console
-from rich.logging import RichHandler
-from rich.text import Text
-from rich.panel import Panel
-from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.live import Live
-from rich import box
-from rich.align import Align
 
 
 # Safe terminal width detection with proper error handling
@@ -38,76 +30,32 @@ def get_terminal_width():
 terminal_width = get_terminal_width()
 console = Console(width=terminal_width, force_terminal=True)
 
-
-# Custom Rich Handler with better formatting
-class CustomRichHandler(RichHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setLevel(logging.INFO)
-
-    def emit(self, record):
-        # Add color coding based on log level
-        if record.levelno >= logging.ERROR:
-            record.msg = f"{record.msg}"
-        elif record.levelno >= logging.WARNING:
-            record.msg = f"{record.msg}"
-        elif record.levelno >= logging.INFO:
-            if "SUCCESSFUL MATCH" in str(record.msg):
-                record.msg = f"{record.msg}"
-            elif "Searching book" in str(record.msg):
-                record.msg = f"{record.msg}"
-            elif "Starting Readarr import" in str(record.msg):
-                record.msg = f"{record.msg}"
-            elif "Downloads added" in str(record.msg):
-                record.msg = f"{record.msg}"
-            elif "All files finished downloading" in str(record.msg):
-                record.msg = f"{record.msg}"
-            else:
-                record.msg = f"{record.msg}"
-
-        super().emit(record)
+logger = logging.getLogger("rsoul.display")
 
 
 def print_startup_banner():
-    """Print a beautiful startup banner using full width"""
-    banner_text = """
-╔══════════════════════════════════════════════════════════════╗
-║                         READARR SOUL                         ║
-║                    Enhanced Book Downloader                  ║
-║                     Powered by Soulseek                     ║
-╚══════════════════════════════════════════════════════════════╝
+    """Print a simple startup banner"""
+    banner = """
+================================================================
+                         READARR SOUL                         
+                    Enhanced Book Downloader                  
+                     Powered by Soulseek                     
+================================================================
     """
-
-    # Use full width panel
-    console.print(Panel(Text(banner_text, style="bold cyan"), box=box.DOUBLE, expand=True, width=console.width))
+    print(banner)
 
 
 def print_search_summary(query, results_count, search_type="main", status="completed"):
-    """Print a formatted search summary using full terminal width"""
-    if search_type == "fallback":
-        style = "yellow"
-        search_text = f"Fallback Search: {query}"
-    else:
-        style = "blue"
-        search_text = f"Main Search: {query}"
-
-    # Force full width by removing width constraints and using ratio
-    table = Table(show_header=False, box=box.ROUNDED, expand=True, width=console.width)
-    table.add_column("", style=style, ratio=1, min_width=20)
-    table.add_column("", style="white", ratio=4)
-
-    table.add_row("Query:", search_text)
-
+    """Print a simple search summary"""
+    prefix = "Fallback Search" if search_type == "fallback" else "Main Search"
     if status == "searching":
-        table.add_row("Status:", "Searching...")
+        logger.info(f"{prefix}: {query} - Status: Searching...")
     else:
-        table.add_row("Results:", f"{results_count} files found")
-
-    console.print(table)
+        logger.info(f"{prefix}: {query} - Results: {results_count} files found")
 
 
 def print_directory_summary(username, directory_data):
-    """Print a clean summary of directory contents using full width"""
+    """Print a clean summary of directory contents"""
     if isinstance(directory_data, list) and len(directory_data) > 0:
         dir_info = directory_data[0]
         file_count = dir_info.get("fileCount", 0)
@@ -119,87 +67,53 @@ def print_directory_summary(username, directory_data):
         file_count = 0
         dir_name = "Unknown"
 
-    # Force full width
-    table = Table(show_header=False, box=box.SIMPLE, expand=True, width=console.width)
-    table.add_column("", style="cyan", ratio=1, min_width=20)
-    table.add_column("", style="white", ratio=4)
-
-    table.add_row("User:", username)
-    table.add_row("Directory:", dir_name.split("\\")[-1])
-    table.add_row("Files:", f"{file_count} files")
-
-    console.print(table)
+    short_dir = dir_name.split("\\")[-1]
+    logger.info(f"User: {username} | Directory: {short_dir} | Files: {file_count}")
 
 
 def print_download_summary(downloads):
-    """Print a formatted table of downloads using full width"""
+    """Print a simple list of downloads"""
     if not downloads:
-        console.print("No downloads to process", style="red")
+        logger.info("No downloads to process")
         return
 
-    # Force full width with explicit width setting
-    table = Table(title="Download Queue", box=box.ROUNDED, expand=True, width=console.width)
-    table.add_column("Username", style="cyan", ratio=1, min_width=15)
-    table.add_column("Directory", style="magenta", ratio=3)
-
+    logger.info("--- Download Queue ---")
     for download in downloads:
         username = download["username"]
         for dir_info in download["directories"]:
-            table.add_row(username, dir_info["directory"])
-
-    console.print(table)
+            logger.info(f"User: {username} | Directory: {dir_info['directory']}")
+    logger.info("----------------------")
 
 
 def print_import_summary(commands):
-    """Print a formatted table of import operations using full width"""
+    """Print a simple list of import operations"""
     if not commands:
         return
 
-    # Force full width
-    table = Table(title="Import Operations", box=box.ROUNDED, expand=True, width=console.width)
-    table.add_column("Author", style="green", ratio=2, min_width=20)
-    table.add_column("Command ID", style="yellow", ratio=1, min_width=12)
-    table.add_column("Status", style="white", ratio=1, min_width=10)
-
+    logger.info("--- Import Operations ---")
     for command in commands:
-        # Extract author name from command if available
         author_name = "Unknown"
         if "body" in command and "path" in command["body"]:
             path = command["body"]["path"]
             author_name = os.path.basename(path)
 
-        table.add_row(author_name, str(command["id"]), "Queued")
-
-    console.print(table)
+        logger.info(f"Author: {author_name} | Command ID: {command['id']} | Status: Queued")
+    logger.info("-------------------------")
 
 
 def print_match_details(filename, ratio, username, filetype):
-    """Print formatted match details using full width"""
-    table = Table(show_header=False, box=box.SIMPLE, expand=True, width=console.width)
-    table.add_column("", style="cyan", ratio=1, min_width=20)
-    table.add_column("", style="white", ratio=4)
-
-    table.add_row("File:", filename)
-    table.add_row("User:", username)
-    table.add_row("Match Ratio:", f"{ratio:.3f}")
-    table.add_row("Type:", filetype)
-
-    console.print(table, style="green")
+    """Print simple match details - toned down version"""
+    short_filename = filename.split("\\")[-1] if "\\" in filename else filename
+    logger.debug(f"Match candidate: {short_filename} (ratio: {ratio:.3f}, user: {username}, type: {filetype})")
 
 
-def print_section_header(title, style="bold blue"):
-    """Print a section header with styling using full width"""
-    # Create a full-width header
-    separator = "=" * console.width
-
-    console.print(f"\n{separator}")
-    console.print(f"  {title}", style=style)
-    console.print(f"{separator}")
+def print_section_header(title, style=None):
+    """Print a section header with a simple separator line"""
+    logger.info("=" * 40 + f" {title} " + "=" * 40)
 
 
 __all__ = [
     "console",
-    "CustomRichHandler",
     "get_terminal_width",
     "print_startup_banner",
     "print_search_summary",

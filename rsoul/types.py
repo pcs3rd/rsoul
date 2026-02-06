@@ -3,6 +3,7 @@ from typing import TypedDict, List, Optional, Any, Dict
 
 class Book(TypedDict, total=False):
     title: str
+    seriesTitle: str
     id: int
     authorId: int
     monitored: bool
@@ -11,21 +12,6 @@ class Book(TypedDict, total=False):
 class Author(TypedDict, total=False):
     authorName: str
     qualityProfileId: int
-
-
-class QualityProfileItem(TypedDict):
-    allowed: bool
-    quality: Dict[str, Any]
-
-
-class QualityProfile(TypedDict):
-    items: List[QualityProfileItem]
-
-
-class DownloadTarget(TypedDict):
-    book: Book
-    author: Author
-    filetypes: QualityProfile
 
 
 class SlskdFile(TypedDict, total=False):
@@ -41,17 +27,3 @@ class SlskdFile(TypedDict, total=False):
 class SlskdDirectory(TypedDict):
     files: List[SlskdFile]
     name: str
-
-
-class BookDownload(TypedDict):
-    author_name: str
-    title: str
-    bookId: int
-    dir: str
-    username: str
-    directory: SlskdDirectory
-    filename: str
-    files: List[SlskdFile]
-    count_start: float
-    rejected_retries: int
-    error_count: int

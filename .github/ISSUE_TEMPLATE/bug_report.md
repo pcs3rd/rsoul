@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Create a bug report to help us improve Soularr (do not use for troubleshooting).
+about: Create a bug report to help us improve R:soul (do not use for troubleshooting).
 title: "[BUG] "
 labels: ''
 assignees: ''
@@ -9,7 +9,7 @@ assignees: ''
 
 **Describe the bug:**
 
-**The issues page is not for troubleshooting! If you need troubleshooting help, please create a post in the Discussions tab or contact us in the Soularr Discord server: https://discord.gg/EznhgYBayN.**
+**The issues page is not for troubleshooting! If you need troubleshooting help, please create a post in the Discussions tab or contact us in the R:soul Discord server: https://discord.gg/mwX4dMSQGH.**
 
 A clear and concise description of what the bug is.
 
