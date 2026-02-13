@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import List, Optional, Any, Dict, TYPE_CHECKING
+from typing import List, Optional, Any, Dict, Tuple, TYPE_CHECKING
 from pathlib import Path
 
 from .base import (
@@ -15,11 +15,68 @@ from . import register_backend
 if TYPE_CHECKING:
     from ..config import Context
 
-from ..search import execute_search, generate_fallback_queries
 from ..download import slskd_do_enqueue, slskd_download_status, downloads_all_done
 from ..match import book_match, verify_filetype
+from ..display import print_search_summary
 
 logger = logging.getLogger(__name__)
+
+
+def _generate_fallback_queries(author_name: str, book_title: str, max_fallbacks: int) -> List[str]:
+    """Generate progressively degraded search queries for blocked word workaround.
+
+    Strategy:
+    1. First name + full title
+    2. First name + title with word 0 dropped
+    3. First name + title with word 1 dropped
+    ...continues left-to-right until max_fallbacks reached
+    """
+    queries = []
+    first_name = author_name.split()[0] if author_name else author_name
+    title_words = book_title.split()
+
+    # Step 1: First name + full title
+    queries.append(f"{first_name} - {book_title}")
+
+    # Steps 2+: Drop words left-to-right
+    for i in range(min(len(title_words), max_fallbacks - 1)):
+        remaining = " ".join(title_words[:i] + title_words[i + 1:])
+        if remaining:
+            queries.append(f"{first_name} - {remaining}")
+
+    return queries[:max_fallbacks]
+
+
+def _execute_search(ctx: "Context", query: str, search_type: str) -> Tuple[List[Dict[str, Any]], str]:
+    """Execute a single SLSKD search and return results.
+
+    Args:
+        ctx: Application context
+        query: Search query string
+        search_type: Label for display (e.g., "main", "fallback-1")
+
+    Returns:
+        Tuple of (search results list, search ID for cleanup)
+    """
+    print_search_summary(query, 0, search_type, "searching")
+
+    search = ctx.slskd.searches.search_text(
+        searchText=query,
+        searchTimeout=ctx.config.getint("Search Settings", "search_timeout", fallback=5000),
+        filterResponses=True,
+        maximumPeerQueueLength=ctx.config.getint("Search Settings", "maximum_peer_queue", fallback=50),
+        minimumPeerUploadSpeed=ctx.config.getint("Search Settings", "minimum_peer_upload_speed", fallback=0),
+    )
+
+    time.sleep(10)
+
+    while ctx.slskd.searches.state(search["id"], False)["state"] == "InProgress":
+        time.sleep(1)
+
+    results = ctx.slskd.searches.search_responses(search["id"])
+    print_search_summary(query, len(results), search_type, "completed")
+
+    return results, search["id"]
 
 
 @register_backend("slskd")
@@ -77,7 +134,7 @@ class SlskdBackend(DownloadBackend):
             queries.append(f"{author_name} - {main_title}")
 
         max_fallbacks = self.config.getint("Search Settings", "max_search_fallbacks", fallback=5)
-        queries.extend(generate_fallback_queries(author_name, book_title, max_fallbacks))
+        queries.extend(_generate_fallback_queries(author_name, book_title, max_fallbacks))
 
         all_results: List[SearchResult] = []
         seen_queries = set()
@@ -95,7 +152,7 @@ class SlskdBackend(DownloadBackend):
 
             search_label = "main" if i == 0 else f"fallback-{i}"
             try:
-                search_results, search_id = execute_search(self.ctx, query, search_label)
+                search_results, search_id = _execute_search(self.ctx, query, search_label)
             except Exception as e:
                 logger.error(f"Search failed for query '{query}': {e}")
                 continue
@@ -220,15 +277,28 @@ class SlskdBackend(DownloadBackend):
         if not ok:
             logger.debug(f"Failed to get status for some files in task {task.task_id}")
 
-        all_done, error_list, remote_queue = downloads_all_done(downloads)
+        all_succeeded, has_errors = downloads_all_done(downloads)
 
-        # Map slskd states to DownloadStatus
-        states = [f.get("status", {}).get("state", "") for f in downloads if f.get("status")]
-
-        if all_done:
+        if all_succeeded:
             task.status = DownloadStatus.COMPLETED
             task.progress_percent = 100.0
-        elif any(s == "Downloading" for s in states):
+            return task
+
+        # Fail fast: if any file has a terminal error, don't wait for others
+        if has_errors:
+            states = set(
+                f.get("status", {}).get("state", "")
+                for f in downloads
+                if f.get("status")
+            )
+            task.status = DownloadStatus.FAILED
+            task.error_message = f"File(s) failed: {', '.join(sorted(states))}"
+            return task
+
+        # Map remaining slskd states to DownloadStatus
+        states = [f.get("status", {}).get("state", "") for f in downloads if f.get("status")]
+
+        if any(s == "Downloading" for s in states):
             task.status = DownloadStatus.DOWNLOADING
             # Calculate aggregate progress
             total_size = sum(f.get("size", 0) for f in downloads)
@@ -237,13 +307,8 @@ class SlskdBackend(DownloadBackend):
                 task.progress_percent = (bytes_transferred / total_size) * 100
         elif any(s == "Queued, Remotely" for s in states):
             task.status = DownloadStatus.QUEUED
-        elif any(s == "Completed, Cancelled" for s in states):
-            task.status = DownloadStatus.CANCELLED
-        elif any(s in ["Completed, TimedOut", "Completed, Errored", "Completed, Rejected", "Completed, Aborted"] for s in states):
-            task.status = DownloadStatus.FAILED
-            task.error_message = f"One or more files failed: {', '.join(set(states))}"
         else:
-            # Check for any pending/initializing states
+            # Pending/initializing states
             task.status = DownloadStatus.PENDING
 
         return task

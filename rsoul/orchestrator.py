@@ -7,7 +7,7 @@ It handles the search → download → monitor lifecycle.
 
 import time
 import logging
-from typing import List, Optional, Dict, Any, TYPE_CHECKING
+from typing import List, Optional, Dict, Any, TYPE_CHECKING, Callable
 
 from .backends.base import (
     DownloadBackend,
@@ -40,7 +40,10 @@ class DownloadOrchestrator:
         self.active_tasks: List[DownloadTask] = []
 
         # Timeouts from config
-        self.stalled_timeout = int(ctx.config.get("Slskd", "stalled_timeout", fallback="3600"))
+        self.stalled_timeout = ctx.config.getint(
+            "General", "stalled_timeout",
+            fallback=ctx.config.getint("Slskd", "stalled_timeout", fallback=3600)
+        )
         self.poll_interval = 10  # seconds between status checks
 
     def get_backend(self, name: str) -> Optional[DownloadBackend]:
@@ -238,7 +241,7 @@ class DownloadOrchestrator:
             "tasks": completed_tasks,
         }
 
-    def batch_process_targets(self, targets: List[DownloadTarget]) -> Dict[str, Any]:
+    def batch_process_targets(self, targets: List[DownloadTarget], on_complete: Optional[Callable[[DownloadTask], None]] = None) -> Dict[str, Any]:
         """Process a list of download targets using batch workflow.
 
         Phase 1: Search & Enqueue all targets (with rate limiting)
@@ -247,6 +250,7 @@ class DownloadOrchestrator:
 
         Args:
             targets: Books to download
+            on_complete: Callback for completed tasks
 
         Returns:
             Dict with stats: succeeded, failed, tasks
@@ -257,22 +261,46 @@ class DownloadOrchestrator:
         logger.info(f"Starting batch processing for {len(targets)} targets")
 
         # Phase 1: Search & Enqueue
+        batch_delay = self.ctx.config.getfloat("General", "batch_delay", fallback=3.0)
+        last_target_time = 0.0
+
         for i, target in enumerate(targets):
-            # Rate limiting (except for first item)
-            if i > 0:
-                # Use a small delay to avoid hitting rate limits
-                time.sleep(3)
+            # Elapsed-time-aware rate limiting (skip for first item)
+            if i > 0 and batch_delay > 0:
+                elapsed = time.time() - last_target_time
+                if elapsed < batch_delay:
+                    time.sleep(batch_delay - elapsed)
+
+            last_target_time = time.time()
 
             task = self.start_download(target)
             if task:
                 active_tasks.append(task)
             else:
                 failed_targets.append(target)
+                # Fire callback with synthetic FAILED task so caller can handle
+                # (summary, unmonitor, failure_list.txt)
+                if on_complete:
+                    failed_task = DownloadTask(
+                        task_id=f"not_found_{target.book_id}",
+                        backend_name="none",
+                        status=DownloadStatus.FAILED,
+                        book_title=target.book_title,
+                        author_name=target.author_name,
+                        book_id=target.book_id,
+                        series_title=target.series_title,
+                        filename="",
+                        error_message="No backend could find or start download",
+                    )
+                    try:
+                        on_complete(failed_task)
+                    except Exception as e:
+                        logger.error(f"Error in on_complete callback for failed target: {e}")
 
         logger.info(f"Batch Enqueue Complete. Active: {len(active_tasks)}, Failed to start: {len(failed_targets)}")
 
         # Phase 2: Monitor
-        completed_tasks = self.monitor_multiple_tasks(active_tasks)
+        completed_tasks = self.monitor_multiple_tasks(active_tasks, on_complete)
 
         # Phase 3: Compile results
         succeeded_tasks = [t for t in completed_tasks if t.status == DownloadStatus.COMPLETED]
@@ -284,11 +312,12 @@ class DownloadOrchestrator:
             "tasks": completed_tasks,
         }
 
-    def monitor_multiple_tasks(self, tasks: List[DownloadTask]) -> List[DownloadTask]:
+    def monitor_multiple_tasks(self, tasks: List[DownloadTask], on_complete: Optional[Callable[[DownloadTask], None]] = None) -> List[DownloadTask]:
         """Monitor multiple tasks concurrently until all complete or timeout.
 
         Args:
             tasks: List of active tasks
+            on_complete: Callback for completed tasks
 
         Returns:
             List of completed tasks (including failed/cancelled)
@@ -317,6 +346,13 @@ class DownloadOrchestrator:
                     task.error_message = "Stalled timeout"
                     completed_map[task_id] = task
                     del active_map[task_id]
+
+                    if on_complete:
+                        try:
+                            on_complete(task)
+                        except Exception as e:
+                            logger.error(f"Error in on_complete callback: {e}")
+
                     continue
 
                 # Poll status
@@ -326,6 +362,13 @@ class DownloadOrchestrator:
                     task.error_message = "Backend unavailable"
                     completed_map[task_id] = task
                     del active_map[task_id]
+
+                    if on_complete:
+                        try:
+                            on_complete(task)
+                        except Exception as e:
+                            logger.error(f"Error in on_complete callback: {e}")
+
                     continue
 
                 try:
@@ -345,6 +388,12 @@ class DownloadOrchestrator:
                         logger.info(f"Task completed: {updated_task.filename}")
                     else:
                         logger.warning(f"Task failed: {updated_task.filename} - {updated_task.error_message}")
+
+                    if on_complete:
+                        try:
+                            on_complete(updated_task)
+                        except Exception as e:
+                            logger.error(f"Error in on_complete callback: {e}")
                 else:
                     # Update the task object in map
                     active_map[task_id] = updated_task
@@ -398,49 +447,16 @@ class DownloadOrchestrator:
 
         return resumed
 
-    def monitor_resumed_tasks(self, tasks: List[DownloadTask]) -> List[DownloadTask]:
+    def monitor_resumed_tasks(self, tasks: List[DownloadTask], on_complete: Optional[Callable[[DownloadTask], None]] = None) -> List[DownloadTask]:
         """Monitor resumed tasks until all complete.
+
+        Delegates to monitor_multiple_tasks for consistent behavior.
 
         Args:
             tasks: Resumed tasks to monitor
+            on_complete: Callback for completed tasks
 
         Returns:
             List of completed tasks
         """
-        if not tasks:
-            return []
-
-        completed: List[DownloadTask] = []
-        pending = list(tasks)
-
-        while pending:
-            still_pending = []
-
-            for task in pending:
-                # Find backend
-                backend = None
-                for b in self.backends:
-                    if b.name == task.backend_name:
-                        backend = b
-                        break
-
-                if not backend:
-                    task.status = DownloadStatus.FAILED
-                    task.error_message = f"Backend {task.backend_name} not available"
-                    completed.append(task)
-                    continue
-
-                # Update status
-                updated_task = backend.get_status(task)
-
-                if updated_task.status in [DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED]:
-                    completed.append(updated_task)
-                else:
-                    still_pending.append(updated_task)
-
-            pending = still_pending
-
-            if pending:
-                time.sleep(self.poll_interval)
-
-        return completed
+        return self.monitor_multiple_tasks(tasks, on_complete)

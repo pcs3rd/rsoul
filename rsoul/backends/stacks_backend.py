@@ -15,6 +15,7 @@ import logging
 import re
 import urllib.parse
 import time
+import os
 from typing import List, Optional, Any, Dict, Tuple, TYPE_CHECKING
 
 import requests
@@ -51,6 +52,9 @@ _aa_mirror_index = 0
 
 # Persistent session for Anna's Archive direct requests
 _aa_session: Optional[Session] = None
+
+# Timestamp of last Anna's Archive request for elapsed-time-aware rate limiting
+_last_aa_request_time: float = 0.0
 
 
 def _get_aa_session() -> Session:
@@ -185,9 +189,12 @@ def score_aa_result(
         return 0.0
 
     # Extract filename from path
-    filename = path.split("/")[-1] if "/" in path else path
+    filename = path.replace("\\", "/").split("/")[-1]
     # Unescape HTML entities
     filename = filename.replace("&amp;", "&").replace("&#39;", "'")
+
+    # Strip extension for matching to prevent format inflation (e.g. .mobi matching query parts)
+    filename_for_match = filename.rsplit(".", 1)[0] if "." in filename else filename
 
     # Also check the full path for author/title info
     # AA paths often have format: source/Genre/Author/Title_id.ext
@@ -195,46 +202,64 @@ def score_aa_result(
 
     # Build expected patterns
     expected_author = normalize_for_matching(author_name)
-    normalized_filename = normalize_for_matching(filename)
+    normalized_filename = normalize_for_matching(filename_for_match)
     normalized_path = normalize_for_matching(path_clean)
 
     score = 0.0
 
     # Check 1: Title containment (strong signal)
-    if title_contained_in_filename(book_title, filename):
+    if title_contained_in_filename(book_title, filename_for_match):
         score += 0.4
         logger.debug(f"Title contained in filename: +0.4")
 
     # Also check against series title if available
-    if series_title and title_contained_in_filename(series_title, filename):
+    if series_title and title_contained_in_filename(series_title, filename_for_match):
         score += 0.2
         logger.debug(f"Series title contained in filename: +0.2")
 
     # Check 2: Jaccard similarity on filename
-    jaccard_score, overlap_count, _ = jaccard_similarity(f"{book_title} {author_name}", filename)
+    jaccard_score, overlap_count, _ = jaccard_similarity(f"{book_title} {author_name}", filename_for_match)
     score += jaccard_score * 0.3
     logger.debug(f"Jaccard similarity: {jaccard_score:.2f} (+{jaccard_score * 0.3:.2f})")
 
-    # Check 3: Author in path (AA often has author as folder name)
-    if expected_author in normalized_path:
-        score += 0.2
-        logger.debug(f"Author found in path: +0.2")
+    # Check 3: Component-wise matching (Calculated early for gating Author Path bonus)
+    # Use MIN score instead of AVG to prevent strong Author match from carrying weak Title match
+    component_title_score = 0.0
 
-    # Check 4: Component-wise matching
-    found_part1, found_part2 = extract_author_title(filename)
+    found_part1, found_part2 = extract_author_title(filename)  # extract_author_title handles extension stripping internally
     if found_part2:
         # Try both orderings
         author_as_p1 = jaccard_similarity(author_name, found_part1)[0]
         title_as_p2 = jaccard_similarity(book_title, found_part2)[0]
-        score_order1 = (author_as_p1 + title_as_p2) / 2
+        score_order1 = min(author_as_p1, title_as_p2)
 
         author_as_p2 = jaccard_similarity(author_name, found_part2)[0]
         title_as_p1 = jaccard_similarity(book_title, found_part1)[0]
-        score_order2 = (author_as_p2 + title_as_p1) / 2
+        score_order2 = min(author_as_p2, title_as_p1)
 
-        component_score = max(score_order1, score_order2) * 0.2
-        score += component_score
-        logger.debug(f"Component matching: +{component_score:.2f}")
+        # Track the best title component score found
+        if score_order1 >= score_order2:
+            component_title_score = title_as_p2
+            final_component_score = score_order1
+        else:
+            component_title_score = title_as_p1
+            final_component_score = score_order2
+
+        weighted_score = final_component_score * 0.2
+        score += weighted_score
+        logger.debug(f"Component matching: +{weighted_score:.2f} (min score {final_component_score:.2f})")
+
+    # Check 4: Author in path (AA often has author as folder name)
+    # GATED: Only apply if we have some evidence of the title matching
+    if expected_author in normalized_path:
+        title_matches = title_contained_in_filename(book_title, filename_for_match)
+
+        # Require either strong title match, decent component title match, or very high Jaccard
+        if title_matches or component_title_score > 0.4 or jaccard_score > 0.6:
+            score += 0.2
+            logger.debug(f"Author found in path: +0.2")
+        else:
+            logger.debug(f"Author found in path but skipped (weak title match): +0.0")
 
     # Check 5: Direct sequence matching as fallback
     direct_ratio = difflib.SequenceMatcher(None, normalize_for_matching(f"{author_name} {book_title}"), normalized_filename).ratio()
@@ -265,7 +290,7 @@ class StacksBackend(DownloadBackend):
         self.poll_interval = self.config.getint("Stacks", "poll_interval", fallback=5)
 
         # Matching threshold
-        self.min_match_ratio = self.config.getfloat("Stacks", "min_match_ratio", fallback=0.5)
+        self.min_match_ratio = self.config.getfloat("Stacks", "min_match_ratio", fallback=0.6)
 
         # FlareSolverr configuration
         self.flaresolverr_enabled = self.config.getboolean("Stacks", "flaresolverr_enabled", fallback=False)
@@ -378,8 +403,17 @@ class StacksBackend(DownloadBackend):
 
     def _search_annas_archive(self, isbn: str, target: DownloadTarget) -> List[SearchResult]:
         """Fetch Anna's Archive search page, parse results, and filter by match score."""
-        # Rate limiting delay
-        time.sleep(5)
+        global _last_aa_request_time
+
+        # Elapsed-time-aware rate limiting: only sleep if not enough time has passed
+        aa_delay = self.config.getfloat("Stacks", "aa_request_delay", fallback=5.0)
+        elapsed = time.time() - _last_aa_request_time
+        if elapsed < aa_delay:
+            wait_time = aa_delay - elapsed
+            logger.debug(f"Rate limiting: waiting {wait_time:.1f}s before next AA request")
+            time.sleep(wait_time)
+
+        _last_aa_request_time = time.time()
 
         # Get next mirror using round-robin
         mirror = _get_next_aa_mirror()
@@ -434,6 +468,11 @@ class StacksBackend(DownloadBackend):
         scored_results: List[Tuple[float, str, str]] = []  # (score, md5, path)
 
         for path, md5 in parsed_results:
+            # Skip if this AA result is already in the blocklist
+            if self.ctx.history and self.ctx.history.is_failed(path, target.book_title):
+                logger.debug(f"Skipping blocklisted result: {path[:60]}...")
+                continue
+
             # Score this result
             match_score = score_aa_result(
                 path=path,
@@ -457,7 +496,8 @@ class StacksBackend(DownloadBackend):
         for score, md5, path in scored_results:
             # Extract filename from path
             if path:
-                filename = path.split("/")[-1] if "/" in path else path
+                # Handle both forward and backslashes in AA paths
+                filename = path.replace("\\", "/").split("/")[-1]
                 filename = filename.replace("&amp;", "&").replace("&#39;", "'")
             else:
                 filename = f"{target.book_title}.epub"
@@ -593,7 +633,23 @@ class StacksBackend(DownloadBackend):
                     return task
 
             # Not found anywhere - might still be processing
-            logger.debug(f"MD5 {md5} not found in Stacks status, keeping current state")
+            # Check local file as fallback (in case it dropped off history)
+            # Use backend's internal directory path which is more reliable
+            filename = task.filename
+            if filename:
+                # Ensure we only use the basename, stripping any directory components (both / and \)
+                clean_filename = filename.replace("\\", "/").split("/")[-1]
+                filepath = os.path.join(self.download_dir, clean_filename)
+                if os.path.exists(filepath):
+                    logger.info(f"MD5 {md5} not found in Stacks status, but file exists on disk: {filepath}")
+                    task.status = DownloadStatus.COMPLETED
+                    return task
+
+            # If not found and not on disk, assume it failed/lost
+            # We can't wait forever, so mark as FAILED
+            logger.warning(f"MD5 {md5} not found in Stacks status or on disk - marking as failed (lost)")
+            task.status = DownloadStatus.FAILED
+            task.error_message = "Task lost from Stacks history and not found on disk"
             return task
 
         except Exception as e:

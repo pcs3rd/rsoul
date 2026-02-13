@@ -1,6 +1,4 @@
 import time
-import os
-import shutil
 import logging
 from typing import Any, Optional, Dict, List, Tuple
 from .types import SlskdFile, SlskdDirectory
@@ -76,37 +74,29 @@ def slskd_download_status(slskd_client: Any, downloads: List[SlskdFile]) -> bool
     return ok
 
 
-def downloads_all_done(downloads: List[SlskdFile]) -> Tuple[bool, Optional[List[SlskdFile]], int]:
+def downloads_all_done(downloads: List[SlskdFile]) -> Tuple[bool, bool]:
     """
-    Checks the status of all the files in a book and returns a flag if all done as well
-    as returning a list of files with errors to check and how many files are in "Queued, Remotely"
+    Check whether all files in a download have reached a terminal state.
+
+    Returns:
+        Tuple of (all_succeeded, has_errors):
+            all_succeeded: True if every file is "Completed, Succeeded"
+            has_errors: True if any file is in a terminal error state
     """
-    all_done = True
-    error_list: List[SlskdFile] = []
-    remote_queue = 0
+    all_succeeded = True
+    has_errors = False
     for file in downloads:
         if file["status"] is not None:
-            if not file["status"]["state"] == "Completed, Succeeded":
-                all_done = False
-            if file["status"]["state"] in [
+            state = file["status"]["state"]
+            if state != "Completed, Succeeded":
+                all_succeeded = False
+            if state in [
                 "Completed, Cancelled",
                 "Completed, TimedOut",
                 "Completed, Errored",
                 "Completed, Rejected",
                 "Completed, Aborted",
             ]:
-                error_list.append(file)
-            if file["status"]["state"] == "Queued, Remotely":
-                remote_queue += 1
+                has_errors = True
 
-    result_error_list: Optional[List[SlskdFile]] = error_list if len(error_list) > 0 else None
-    return all_done, result_error_list, remote_queue
-
-
-def cancel_and_delete(slskd_client: Any, delete_dir: str, username: str, files: List[SlskdFile], download_base_dir: str) -> None:
-    for file in files:
-        slskd_client.transfers.cancel_download(username=username, id=file["id"])
-
-    os.chdir(download_base_dir)
-    if os.path.exists(delete_dir):
-        shutil.rmtree(delete_dir)
+    return all_succeeded, has_errors

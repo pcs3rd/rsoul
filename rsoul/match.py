@@ -85,26 +85,28 @@ def book_match(
         return None
 
     for slskd_file in filtered_files:
-        slskd_filename = slskd_file["filename"].split("\\")[-1]
+        slskd_filename_full = slskd_file["filename"].split("\\")[-1]
+        # Remove extension for matching to prevent "epub" from inflating scores
+        slskd_filename = slskd_filename_full.rsplit(".", 1)[0] if "." in slskd_filename_full else slskd_filename_full
 
-        # Build expected filename pattern for pre-filter comparison
-        expected_pattern = f"{book_title} - {author_name}.{filetype.split(' ')[0]}"
+        # Build expected filename pattern for pre-filter comparison (without extension)
+        expected_pattern = f"{book_title} - {author_name}"
 
         # Pre-filter 1: Length ratio gate
         len_ratio = length_ratio(expected_pattern, slskd_filename)
         if len_ratio < min_length_ratio:
-            logger.debug(f"Skipping {slskd_filename}: length ratio {len_ratio:.2f} < {min_length_ratio}")
+            logger.debug(f"Skipping {slskd_filename_full}: length ratio {len_ratio:.2f} < {min_length_ratio}")
             continue
 
         # Pre-filter 2: Jaccard token overlap
         jaccard_score, overlap_count, _ = jaccard_similarity(expected_pattern, slskd_filename)
         if jaccard_score < min_jaccard_ratio:
-            logger.debug(f"Skipping {slskd_filename}: Jaccard {jaccard_score:.2f} < {min_jaccard_ratio}")
+            logger.debug(f"Skipping {slskd_filename_full}: Jaccard {jaccard_score:.2f} < {min_jaccard_ratio}")
             continue
 
         # Pre-filter 3: Minimum word overlap
         if overlap_count < min_word_overlap:
-            logger.debug(f"Skipping {slskd_filename}: word overlap {overlap_count} < {min_word_overlap}")
+            logger.debug(f"Skipping {slskd_filename_full}: word overlap {overlap_count} < {min_word_overlap}")
             continue
 
         # Pre-filter 4: Component-wise matching (author vs author, title vs title)
@@ -129,29 +131,28 @@ def book_match(
 
             # Both components must meet their thresholds
             if author_score < min_author_jaccard:
-                logger.debug(f"Skipping {slskd_filename}: author Jaccard {author_score:.2f} < {min_author_jaccard}")
+                logger.debug(f"Skipping {slskd_filename_full}: author Jaccard {author_score:.2f} < {min_author_jaccard}")
                 continue
 
             if title_score < min_title_jaccard:
-                logger.debug(f"Skipping {slskd_filename}: title Jaccard {title_score:.2f} < {min_title_jaccard}")
+                logger.debug(f"Skipping {slskd_filename_full}: title Jaccard {title_score:.2f} < {min_title_jaccard}")
                 continue
 
             logger.debug(f"Component match passed: author={author_score:.2f}, title={title_score:.2f}")
 
-        logger.info(f"Checking ratio on {slskd_filename} vs wanted {book_title} - {author_name}.{filetype.split(' ')[0]}")
+        logger.info(f"Checking ratio on {slskd_filename_full} vs wanted {book_title} - {author_name}")
 
-        # First, check if this looks like a very good match based on title containment
-        title_bonus = 0.0
-        if title_contained_in_filename(book_title, slskd_filename):
-            title_bonus = 0.3  # Significant bonus for files that clearly contain the target title
-            logger.info(f"Title containment bonus applied: +{title_bonus}")
+        # Mandatory requirement: Title must be contained in the filename
+        if not title_contained_in_filename(book_title, slskd_filename):
+            logger.debug(f"Skipping {slskd_filename_full}: Title '{book_title}' not found in filename")
+            continue
 
         # Try multiple filename patterns for matching
         patterns_to_try = [
-            f"{book_title} - {author_name}.{filetype.split(' ')[0]}",
-            f"{author_name} - {book_title}.{filetype.split(' ')[0]}",
-            f"{book_title}.{filetype.split(' ')[0]}",
-            f"{author_name} {book_title}.{filetype.split(' ')[0]}",
+            f"{book_title} - {author_name}",
+            f"{author_name} - {book_title}",
+            f"{book_title}",
+            f"{author_name} {book_title}",
         ]
 
         max_ratio = 0.0
@@ -174,15 +175,14 @@ def book_match(
             ratio = check_ratio("_", ratio, pattern, slskd_filename, minimum_match_ratio)
             max_ratio = max(max_ratio, ratio)
 
-        # Apply title bonus if applicable
-        final_ratio = max_ratio + title_bonus
+        final_ratio = max_ratio
 
         if final_ratio > best_match:
-            logger.info(f"New best match found! Ratio: {max_ratio:.3f} + Title bonus: {title_bonus:.3f} = {final_ratio:.3f}")
+            logger.info(f"New best match found! Ratio: {final_ratio:.3f}")
             best_match = final_ratio
             current_match = slskd_file
         else:
-            logger.info(f"Ratio: {max_ratio:.3f} + Title bonus: {title_bonus:.3f} = {final_ratio:.3f} (not better than current best: {best_match:.3f})")
+            logger.info(f"Ratio: {final_ratio:.3f} (not better than current best: {best_match:.3f})")
 
     if (current_match != None) and (username not in ignored_users) and (best_match >= minimum_match_ratio):
         # Log match found (toned down - details logged at DEBUG level)

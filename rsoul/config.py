@@ -6,6 +6,8 @@ from typing import Any, Optional, Dict
 
 from .display import console
 
+logger = logging.getLogger(__name__)
+
 if False:  # TYPE_CHECKING hack to avoid circular imports at runtime if needed, though simple import is usually fine
     from .history import HistoryManager
     from .state import StateManager
@@ -103,9 +105,13 @@ def setup_logging(config):
 def validate_config(config: configparser.ConfigParser) -> None:
     """
     Validate that the configuration has all required sections and keys.
+
+    Conditionally validates backend-specific sections when those backends
+    are enabled in [Backends].
     """
+    KNOWN_BACKENDS = {"slskd", "stacks"}
+
     required = {
-        "Slskd": ["api_key", "host_url"],
         "Readarr": ["api_key", "host_url"],
     }
 
@@ -115,6 +121,34 @@ def validate_config(config: configparser.ConfigParser) -> None:
         for key in keys:
             if key not in config[section]:
                 raise ValueError(f"Configuration Error: Missing required key '{key}' in section '{section}'")
+
+    # Validate backend-specific sections when enabled
+    slskd_enabled = config.getboolean("Backends", "slskd_enabled", fallback=True)
+    stacks_enabled = config.getboolean("Backends", "stacks_enabled", fallback=False)
+
+    if slskd_enabled:
+        slskd_required = ["api_key", "host_url"]
+        if "Slskd" not in config:
+            raise ValueError("Configuration Error: Slskd backend is enabled but '[Slskd]' section is missing")
+        for key in slskd_required:
+            if key not in config["Slskd"]:
+                raise ValueError(f"Configuration Error: Missing required key '{key}' in section 'Slskd'")
+
+    if stacks_enabled:
+        stacks_required = ["api_key", "host_url", "download_dir"]
+        if "Stacks" not in config:
+            raise ValueError("Configuration Error: Stacks backend is enabled but '[Stacks]' section is missing")
+        for key in stacks_required:
+            if key not in config["Stacks"]:
+                raise ValueError(f"Configuration Error: Missing required key '{key}' in section 'Stacks'")
+
+    # Validate priority list references only known backends
+    if "Backends" in config:
+        priority_str = config.get("Backends", "priority", fallback="slskd")
+        priority_backends = [b.strip().lower() for b in priority_str.split(",") if b.strip()]
+        unknown = set(priority_backends) - KNOWN_BACKENDS
+        if unknown:
+            logger.warning(f"Unknown backend(s) in priority list: {unknown}. Known backends: {KNOWN_BACKENDS}")
 
 
 @dataclass

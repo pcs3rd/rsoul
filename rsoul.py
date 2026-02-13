@@ -46,7 +46,7 @@ def main():
     config_dir = args.config_dir
 
     # Path setup
-    lock_file_path = os.path.join(config_dir, ".soularr.lock")
+    lock_file_path = os.path.join(config_dir, ".rsoul.lock")
     config_file_path = os.path.join(config_dir, "config.ini")
 
     # Lock check
@@ -85,9 +85,7 @@ def main():
         validate_config(config)
 
         # Extract Config Values
-        slskd_api_key = config["Slskd"]["api_key"]
-        slskd_host_url = config["Slskd"]["host_url"]
-        slskd_url_base = config.get("Slskd", "url_base", fallback="/")
+        slskd_enabled = config.getboolean("Backends", "slskd_enabled", fallback=True)
 
         readarr_api_key = config["Readarr"]["api_key"]
         readarr_host_url = config["Readarr"]["host_url"]
@@ -102,7 +100,12 @@ def main():
         page_size = config.getint("Search Settings", "number_of_books_to_grab", fallback=10)
 
         # Initialize Clients
-        slskd = slskd_api.SlskdClient(host=slskd_host_url, api_key=slskd_api_key, url_base=slskd_url_base)
+        slskd = None
+        if slskd_enabled:
+            slskd_api_key = config["Slskd"]["api_key"]
+            slskd_host_url = config["Slskd"]["host_url"]
+            slskd_url_base = config.get("Slskd", "url_base", fallback="/")
+            slskd = slskd_api.SlskdClient(host=slskd_host_url, api_key=slskd_api_key, url_base=slskd_url_base)
         readarr = ReadarrAPI(readarr_host_url, readarr_api_key)
 
         # Initialize History Manager
@@ -128,30 +131,31 @@ def main():
         if has_saved_state:
             console.print(f"\nFound saved state with {len(state_manager.get_items())} pending downloads", style="bold yellow")
 
-        # Fetch Wanted Books
+        # Fetch Wanted Books (skip if we only have saved state to resume)
         wanted_books = []
-        try:
-            for source in search_sources:
-                logger.debug(f"Getting records from {source}")
-                wanted_books.extend(get_books(ctx, source, search_type, page_size))
-        except ValueError as ex:
-            logger.error(f"An error occurred: {ex}")
-            logger.error("Exiting...")
-            sys.exit(0)
-
-        # Construct Download Targets
         download_targets = []
-        if len(wanted_books) > 0:
-            console.print(f"\nFound {len(wanted_books)} wanted books to process", style="bold green")
+        if not has_saved_state:
+            try:
+                for source in search_sources:
+                    logger.debug(f"Getting records from {source}")
+                    wanted_books.extend(get_books(ctx, source, search_type, page_size))
+            except ValueError as ex:
+                logger.error(f"An error occurred: {ex}")
+                logger.error("Exiting...")
+                sys.exit(0)
 
-            for book in wanted_books:
-                try:
-                    authorID = book["authorId"]
-                    author = ctx.readarr.get_author(authorID)
-                    download_targets.append({"book": book, "author": author})
-                except Exception:
-                    logger.exception(f"Error processing book {book.get('title', 'unknown')}")
-                    continue
+            # Construct Download Targets
+            if len(wanted_books) > 0:
+                console.print(f"\nFound {len(wanted_books)} wanted books to process", style="bold green")
+
+                for book in wanted_books:
+                    try:
+                        authorID = book["authorId"]
+                        author = ctx.readarr.get_author(authorID)
+                        download_targets.append({"book": book, "author": author})
+                    except Exception:
+                        logger.exception(f"Error processing book {book.get('title', 'unknown')}")
+                        continue
 
         # Run Workflow
         # Run if we have download targets OR if we have saved state to resume

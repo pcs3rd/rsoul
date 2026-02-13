@@ -14,6 +14,18 @@ services:
     volumes:
       #"You can set /downloads to whatever you want but will then need to change the Slskd download dir in your config file"
       - /path/to/slskd/downloads:/downloads
+      # Stacks download directory (uncomment if using Stacks backend)
+      # - /path/to/stacks/downloads:/stacks-downloads
       #Select where you are storing your config file. Leave "/data" since thats where the script expects the config file to be
       - /path/to/config/dir:/data
     image: mephistopheles1/rsoul:latest
+
+  # Uncomment to run FlareSolverr for DDoS-Guard bypass (used by Stacks backend)
+  # flaresolverr:
+  #   image: ghcr.io/flaresolverr/flaresolverr:latest
+  #   container_name: flaresolverr
+  #   restart: unless-stopped
+  #   environment:
+  #     - LOG_LEVEL=info
+  #   ports:
+  #     - "8191:8191"

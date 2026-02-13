@@ -9,16 +9,24 @@ from typing import Any
 
 from mobi_header import MobiHeader
 import ebookmeta
-from .utils import sanitize_folder_name, jaccard_similarity
+from .utils import sanitize_folder_name, jaccard_similarity, extract_author_title
 from .display import print_import_summary, print_section_header
 
 logger = logging.getLogger("readarr_soul")
 
 
-def move_failed_import(src_path: str):
-    """Move failed import to failed_imports directory with better error handling"""
+def move_failed_import(src_path: str, base_dir: str = ""):
+    """Move failed import to failed_imports directory with better error handling.
+
+    Args:
+        src_path: Path to the source file/folder to move
+        base_dir: Base directory for the failed_imports folder. If empty, uses
+                  the parent directory of src_path.
+    """
     try:
-        failed_imports_dir = "failed_imports"
+        if not base_dir:
+            base_dir = os.path.dirname(src_path)
+        failed_imports_dir = os.path.join(base_dir, "failed_imports")
         if not os.path.exists(failed_imports_dir):
             os.makedirs(failed_imports_dir)
             logger.info(f"Created failed imports directory: {failed_imports_dir}")
@@ -158,6 +166,34 @@ def check_swapped_author_title(metadata_title: str, expected_author: str, expect
     return False
 
 
+def get_metadata_author(file_path: str, extension: str, metadata: Any = None) -> str:
+    """Extract author from metadata based on file extension."""
+    author = ""
+    try:
+        if extension == "epub":
+            if not metadata:
+                metadata = ebookmeta.get_metadata(file_path)
+            # ebookmeta usually returns author_list
+            if hasattr(metadata, "author_list") and metadata.author_list:
+                author = metadata.author_list[0]
+            elif hasattr(metadata, "creator"):
+                author = metadata.creator
+        elif extension in ["azw3", "mobi"]:
+            if not metadata:
+                metadata = MobiHeader(file_path)
+            # Try EXTH 100 (Author)
+            val = metadata.get_exth_value_by_id(100)
+            if val:
+                if isinstance(val, bytes):
+                    author = val.decode("utf-8", errors="ignore")
+                else:
+                    author = str(val)
+    except Exception as e:
+        logger.debug(f"Failed to extract author from metadata: {e}")
+
+    return author.strip()
+
+
 def validate_metadata(file_path: str, book_title: str, book_id: int, ctx: Any, series_title: str = "", author_name: str = "") -> bool:
     """
     Validate file metadata against Readarr book info.
@@ -196,7 +232,7 @@ def validate_metadata(file_path: str, book_title: str, book_id: int, ctx: Any, s
             title = None
             # Try getting full name from metadata dict
             if hasattr(metadata, "metadata") and "full_name" in metadata.metadata:
-                title = metadata.metadata["full_name"].get("value")
+                title = metadata.metadata["full_name"].get("value")  # type: ignore
 
             # Fallback to EXTH 503 (Updated Title)
             if not title:
@@ -217,8 +253,18 @@ def validate_metadata(file_path: str, book_title: str, book_id: int, ctx: Any, s
 
                 # Check for swapped author/title fields
                 if author_name and check_swapped_author_title(title, author_name, book_title):
-                    logger.warning("Metadata appears to have swapped author/title - rejecting")
-                    match = False
+                    logger.warning("Metadata appears to have swapped author/title (Title field contains Author name)")
+
+                    # Check if the Author field contains the Title (confirm swap)
+                    meta_author = get_metadata_author(file_path, extension, metadata)
+                    logger.info(f"Checking metadata Author field: '{meta_author}' against expected Title: '{book_title}'")
+
+                    if meta_author and check_title_similarity(meta_author, book_title, ratio_exact, ratio_normalized, ratio_word, ratio_loose, ratio_jaccard, label="swapped_author"):
+                        logger.info("Confirmed valid swapped metadata (Author field matches Title). Accepting.")
+                        match = True
+                    else:
+                        logger.warning("Could not confirm valid title in Author field - rejecting.")
+                        match = False
                 else:
                     # Check against book title
                     title_match = check_title_similarity(title, book_title, ratio_exact, ratio_normalized, ratio_word, ratio_loose, ratio_jaccard, label="title")
@@ -256,8 +302,18 @@ def validate_metadata(file_path: str, book_title: str, book_id: int, ctx: Any, s
 
                 # Check for swapped author/title fields
                 if author_name and check_swapped_author_title(title, author_name, book_title):
-                    logger.warning("Metadata appears to have swapped author/title - rejecting")
-                    match = False
+                    logger.warning("Metadata appears to have swapped author/title (Title field contains Author name)")
+
+                    # Check if the Author field contains the Title (confirm swap)
+                    meta_author = get_metadata_author(file_path, extension, metadata)
+                    logger.info(f"Checking metadata Author field: '{meta_author}' against expected Title: '{book_title}'")
+
+                    if meta_author and check_title_similarity(meta_author, book_title, ratio_exact, ratio_normalized, ratio_word, ratio_loose, ratio_jaccard, label="swapped_author"):
+                        logger.info("Confirmed valid swapped metadata (Author field matches Title). Accepting.")
+                        match = True
+                    else:
+                        logger.warning("Could not confirm valid title in Author field - rejecting.")
+                        match = False
                 else:
                     # Check against book title
                     title_match = check_title_similarity(title, book_title, ratio_exact, ratio_normalized, ratio_word, ratio_loose, ratio_jaccard, label="title")
@@ -288,18 +344,29 @@ def validate_metadata(file_path: str, book_title: str, book_id: int, ctx: Any, s
     return match
 
 
-def organize_file(source_path: str, target_folder: str, filename: str, original_folder: str) -> bool:
+def organize_file(source_path: str, target_folder: str, filename: str, original_folder: str, base_dir: str = "") -> bool:
     """
     Organize file into author folder and clean up source directory.
     Returns True if successful, False on error.
+
+    Args:
+        source_path: Absolute path to the source file
+        target_folder: Author folder name (relative to base_dir)
+        filename: Filename to use in the target folder
+        original_folder: Source directory to clean up if empty
+        base_dir: Base directory for the target folder. If empty, target_folder
+                  is used as-is (legacy behavior).
     """
     try:
-        # Create target directory
-        if not os.path.exists(target_folder):
-            logger.info(f"Creating author directory: {target_folder}")
-            os.makedirs(target_folder, exist_ok=True)
+        # Resolve target directory as absolute path
+        abs_target_folder = os.path.join(base_dir, target_folder) if base_dir else target_folder
 
-        target_file_path = os.path.join(target_folder, filename)
+        # Create target directory
+        if not os.path.exists(abs_target_folder):
+            logger.info(f"Creating author directory: {abs_target_folder}")
+            os.makedirs(abs_target_folder, exist_ok=True)
+
+        target_file_path = os.path.join(abs_target_folder, filename)
 
         if os.path.exists(source_path) and not os.path.exists(target_file_path):
             logger.info(f"Moving file from {source_path} to {target_file_path}")
@@ -308,9 +375,10 @@ def organize_file(source_path: str, target_folder: str, filename: str, original_
 
             # Clean up source directory if empty (but don't delete base download dirs)
             try:
-                if original_folder and original_folder not in [".", os.getcwd()] and os.path.exists(original_folder) and not os.listdir(original_folder):
-                    logger.info(f"Removing empty source directory: {original_folder}")
-                    shutil.rmtree(original_folder)
+                abs_original = os.path.join(base_dir, original_folder) if base_dir else original_folder
+                if abs_original and abs_original != base_dir and os.path.exists(abs_original) and not os.listdir(abs_original):
+                    logger.info(f"Removing empty source directory: {abs_original}")
+                    shutil.rmtree(abs_original)
             except OSError as e:
                 logger.warning(f"Could not remove source directory {original_folder}: {e}")
 
@@ -473,13 +541,7 @@ def process_imports(ctx: Any, grab_list: list):
             logger.error(f"Download directory not found for {backend_name}: {local_download_dir}")
             continue
 
-        # Change to backend's download directory so organize_file works with relative paths
-        try:
-            os.chdir(local_download_dir)
-            logger.info(f"Changed to download directory: {local_download_dir}")
-        except OSError as e:
-            logger.error(f"Failed to change to directory {local_download_dir}: {e}")
-            continue
+        logger.info(f"Using download directory: {local_download_dir}")
 
         items.sort(key=operator.itemgetter("author_name"))
         failed_imports = []
@@ -503,16 +565,16 @@ def process_imports(ctx: Any, grab_list: list):
                 book_title = book_download["title"]
                 series_title = book_download.get("seriesTitle", "")
                 book_id = book_download["bookId"]
-                username = book_download.get("username", "")
+                source_id = book_download.get("source_id", book_download.get("username", ""))
 
                 logger.info(f"Processing file: {filename} for book: {book_title}")
-                source_file_path = os.path.join(folder, filename)
+                source_file_path = os.path.join(local_download_dir, folder, filename)
 
                 if not os.path.exists(source_file_path):
                     logger.error(f"Source file not found: {source_file_path}")
                     failed_imports.append((folder, filename, author_name_sanitized, f"Source file not found: {source_file_path}"))
                     if ctx.history:
-                        ctx.history.add_failure(username, book_title, "Source file not found")
+                        ctx.history.add_failure(source_id, book_title, "Source file not found")
                     continue
 
                 # 1. Validate Metadata (skip for stacks backend - trust AA matching)
@@ -525,27 +587,27 @@ def process_imports(ctx: Any, grab_list: list):
 
                 if validation_passed:
                     # 2. Organize File
-                    if organize_file(source_file_path, author_name_sanitized, filename, folder):
+                    if organize_file(source_file_path, author_name_sanitized, filename, folder, local_download_dir):
                         logger.info(f"Successfully processed {filename}")
                         author_folders.add(author_name_sanitized)
                     else:
                         failed_imports.append((folder, filename, author_name_sanitized, "Failed to organize file"))
                         if ctx.history:
-                            ctx.history.add_failure(username, book_title, "Failed to organize file")
+                            ctx.history.add_failure(source_id, book_title, "Failed to organize file")
                 else:
                     logger.warning(f"Metadata validation failed for {filename}")
                     failed_imports.append((folder, filename, author_name_sanitized, "Metadata validation failed"))
                     if ctx.history:
-                        ctx.history.add_failure(username, book_title, "Metadata validation failed")
+                        ctx.history.add_failure(source_id, book_title, "Metadata validation failed")
 
             except Exception:
                 logger.exception(f"Unexpected error processing {book_download.get('filename', 'unknown')}")
                 failed_imports.append((book_download.get("dir", "unknown"), book_download.get("filename", "unknown"), book_download.get("author_name", "unknown"), "Unexpected error"))
                 if ctx.history:
-                    u = book_download.get("username", "")
+                    sid = book_download.get("source_id", book_download.get("username", ""))
                     t = book_download.get("title", "")
-                    if u and t:
-                        ctx.history.add_failure(u, t, "Unexpected processing error")
+                    if sid and t:
+                        ctx.history.add_failure(sid, t, "Unexpected processing error")
 
         # Handle failed imports
         if failed_imports:
@@ -554,7 +616,7 @@ def process_imports(ctx: Any, grab_list: list):
             for folder, filename, author_name_sanitized, error_reason in failed_imports:
                 logger.warning(f"Failed: {filename} - Reason: {error_reason}")
 
-                failed_imports_dir = "failed_imports"
+                failed_imports_dir = os.path.join(local_download_dir, "failed_imports")
                 try:
                     if not os.path.exists(failed_imports_dir):
                         os.makedirs(failed_imports_dir)
@@ -568,13 +630,14 @@ def process_imports(ctx: Any, grab_list: list):
 
                     os.makedirs(target_path, exist_ok=True)
 
-                    source_file_path = os.path.join(folder, filename)
+                    source_file_path = os.path.join(local_download_dir, folder, filename)
                     if os.path.exists(source_file_path):
                         shutil.move(source_file_path, target_path)
                         logger.info(f"Moved failed file to: {target_path}")
 
-                        if os.path.exists(folder) and not os.listdir(folder):
-                            shutil.rmtree(folder)
+                        abs_folder = os.path.join(local_download_dir, folder)
+                        if os.path.exists(abs_folder) and not os.listdir(abs_folder):
+                            shutil.rmtree(abs_folder)
 
                 except Exception as e:
                     logger.error(f"Failed to move failed import: {e}")

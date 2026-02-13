@@ -122,12 +122,50 @@ def title_contained_in_filename(target_title: str, filename: str) -> bool:
         return True
 
     # Check word-by-word containment for partial matches
-    target_words = set(normalized_target.split())
-    filename_words = set(normalized_filename.split())
-
-    # If most of the target words are in the filename, it's likely a match
-    if not target_words:
+    target_word_list = normalized_target.split()
+    if not target_word_list:
         return False
 
-    overlap = len(target_words.intersection(filename_words))
-    return overlap >= len(target_words) * 0.7  # 70% word overlap
+    target_words = set(target_word_list)
+    filename_words = set(normalized_filename.split())
+
+    # Filter out common stop words to avoid false positives on "The", "A", etc.
+    stop_words = {"the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for", "by", "with"}
+    filtered_target_words = {w for w in target_words if w not in stop_words}
+
+    # If all words were stop words (unlikely), revert to full set
+    if not filtered_target_words:
+        filtered_target_words = target_words
+
+    overlap = len(filtered_target_words.intersection(filename_words))
+
+    # Require 80% overlap of meaningful words (up from 70% of all words)
+    if overlap < len(filtered_target_words) * 0.8:
+        return False
+
+    # --- NEW: Order Check for all titles ---
+    # Identify matching words from the target_title that are present in the filename
+    matching_words_in_order = [w for w in target_word_list if w in filename_words]
+
+    if matching_words_in_order:
+        # Construct a regex to verify that these words appear in the filename in that specific sequence
+        # Use \b for word boundaries to avoid matching parts of words
+        pattern = r".*".join([rf"\b{re.escape(w)}\b" for w in matching_words_in_order])
+        if not re.search(pattern, normalized_filename):
+            return False
+
+    # For short titles (<= 2 words), enforce stricter proximity to avoid false positives
+    # e.g. "Dark One" shouldn't match "Dark Watch Volume One" (too many words in between)
+    if len(filtered_target_words) <= 2:
+        # Get meaningful words in their original order
+        ordered_filtered_words = [w for w in target_word_list if w in filtered_target_words]
+
+        # Build pattern: word1 + (0-1 intervening words) + word2
+        # Escaping words to handle special regex chars if any
+        pattern_parts = [re.escape(w) for w in ordered_filtered_words]
+        proximity_pattern = r"(?:\s+\S+){0,1}\s+".join(pattern_parts)
+
+        if not re.search(proximity_pattern, normalized_filename):
+            return False
+
+    return True

@@ -30,50 +30,60 @@ class HistoryManager:
             self.history = []
 
     def save(self):
-        """Save history to JSON file."""
+        """Save history to JSON file using atomic write (temp file + rename)."""
+        tmp_path = self.file_path + ".tmp"
         try:
-            with open(self.file_path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.history, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, self.file_path)
         except Exception as e:
             logger.error(f"Failed to save history to {self.file_path}: {e}")
+            # Clean up temp file if it exists
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
-    def add_failure(self, username: str, book_title: str, reason: str = ""):
+    def add_failure(self, source_id: str, book_title: str, reason: str = ""):
         """
         Record a failed download/import.
 
         Args:
-            username: The Soulseek username.
+            source_id: Backend-specific identifier (slskd username, AA path, etc.)
             book_title: The canonical book title from Readarr.
             reason: Optional reason for failure.
         """
-        if not username or not book_title:
+        if not source_id or not book_title:
             return
 
         # Check if already exists to avoid duplicates
-        if self.is_failed(username, book_title):
+        if self.is_failed(source_id, book_title):
             return
 
-        entry = {"username": username, "book_title": book_title, "timestamp": datetime.now().isoformat(), "reason": reason}
+        entry = {"source_id": source_id, "book_title": book_title, "timestamp": datetime.now().isoformat(), "reason": reason}
         self.history.append(entry)
-        logger.info(f"Added to blocklist: User '{username}' for Book '{book_title}'")
+        logger.info(f"Added to blocklist: '{source_id}' for Book '{book_title}'")
         self.save()
 
-    def is_failed(self, username: str, book_title: str) -> bool:
+    def is_failed(self, source_id: str, book_title: str) -> bool:
         """
-        Check if a username/book combo is in the blocklist.
+        Check if a source_id/book combo is in the blocklist.
         Case-insensitive comparison.
+        Backwards-compatible: reads both 'source_id' and legacy 'username' fields.
         """
-        if not username or not book_title:
+        if not source_id or not book_title:
             return False
 
-        target_user = username.strip().lower()
+        target_source = source_id.strip().lower()
         target_book = book_title.strip().lower()
 
         for entry in self.history:
-            h_user = entry.get("username", "").strip().lower()
+            # Support both new 'source_id' and legacy 'username' field
+            h_source = entry.get("source_id", entry.get("username", "")).strip().lower()
             h_book = entry.get("book_title", "").strip().lower()
 
-            if h_user == target_user and h_book == target_book:
+            if h_source == target_source and h_book == target_book:
                 return True
 
         return False

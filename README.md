@@ -79,7 +79,7 @@ This project is a fork of [Soularr](https://github.com/mrusse/soularr) (original
 | `download_dir` | - | Local path to Stacks downloads |
 | `readarr_download_dir` | (same as download_dir) | Path as seen by Readarr |
 | `search_timeout` | 30 | Timeout for Anna's Archive searches (seconds) |
-| `min_match_ratio` | 0.5 | Minimum title/author match score |
+| `min_match_ratio` | 0.6 | Minimum title/author match score |
 | `flaresolverr_enabled` | `False` | Enable FlareSolverr for DDoS bypass |
 | `flaresolverr_url` | `http://localhost:8191/v1` | FlareSolverr API endpoint |
 
