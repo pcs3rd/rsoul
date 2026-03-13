@@ -2,6 +2,7 @@ import logging
 import time
 from typing import List, Optional, Any, Dict, Tuple, TYPE_CHECKING
 from pathlib import Path
+from ratelimit import limits
 
 from .base import (
     DownloadBackend,
@@ -46,7 +47,7 @@ def _generate_fallback_queries(author_name: str, book_title: str, max_fallbacks:
 
     return queries[:max_fallbacks]
 
-
+@limits(calls=30, period=60)
 def _execute_search(ctx: "Context", query: str, search_type: str) -> Tuple[List[Dict[str, Any]], str]:
     """Execute a single SLSKD search and return results.
 
