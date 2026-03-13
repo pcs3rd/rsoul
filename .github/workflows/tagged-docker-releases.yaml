@@ -1,11 +1,11 @@
-#   Setup
-#   Create a Github PAT with write:packages permissions, then add it as a secret to this github repo, with the name GITHUB_TOKEN
 
 name: Create and publish a Docker image on new release
 
 # Configures this workflow to run every time a change is pushed to the branch called `release`.
 on:
-  push: tags
+  push: 
+    tags: 
+      - 'release.*'
 
 # Defines two custom environment variables for the workflow. These are used for the Container registry domain, and a name for the Docker image that this workflow builds.
 env:
